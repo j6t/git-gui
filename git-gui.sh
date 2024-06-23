@@ -799,6 +799,16 @@ if {[is_Windows]} {
 ## config defaults
 
 set cursor_ptr arrow
+
+# For whatever reason, Tk does not apply font scaling to default fonts,
+# but applies font scaling when setting size explicitly.
+# Default -size 10 is still 10, when you look at it with `font actual ...`,
+# but explicit -size 10 becomes 10 * scale factor.
+# So, we need to configure fonts to use their default font sizes, but scaled.
+foreach font_name [font names] {
+	font configure $font_name -size [font actual $font_name -size]
+}
+
 font create font_ui
 if {[lsearch -exact [font names] TkDefaultFont] != -1} {
 	eval [linsert [font actual TkDefaultFont] 0 font configure font_ui]
