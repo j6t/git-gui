@@ -3,26 +3,35 @@
 
 proc do_windows_shortcut {} {
 	global _gitworktree
-	set fn [tk_getSaveFile \
-		-parent . \
-		-title [mc "%s (%s): Create Desktop Icon" [appname] [reponame]] \
-		-initialfile "Git [reponame].lnk"]
-	if {$fn != {}} {
-		if {[file extension $fn] ne {.lnk}} {
-			set fn ${fn}.lnk
+
+	set desktop [exec cygpath -mD]
+	set link_file "Git [reponame].lnk"
+	set link_path [file normalize [file join $desktop $link_file]]
+
+	# on Windows, tk_getSaveFile derefernces .lnk files, so no simple
+	# filename chooser is available. Use the default or quit.
+	if {[file exists $link_path]} {
+		set answer [tk_messageBox \
+			-type yesno \
+			-title {git-gui create shortcut} \
+			-default yes \
+			-message "Replace existing shortcut: $link_file?"]
+		if {$answer == no} {
+			return
 		}
-		# Use git-gui.exe if available (ie: git-for-windows)
-		set cmdLine [list [_which git-gui]]
-		if {$cmdLine eq {}} {
-			set cmdLine [list [info nameofexecutable] \
-							 [file normalize $::argv0]]
-		}
-		if {[catch {
-				win32_create_lnk $fn $cmdLine \
-					[file normalize $_gitworktree]
-			} err]} {
-			error_popup [strcat [mc "Cannot write shortcut:"] "\n\n$err"]
-		}
+	}
+
+	# Use git-gui.exe if available (ie: git-for-windows)
+	set cmdLine [list [_which git-gui]]
+	if {$cmdLine eq {}} {
+		set cmdLine [list [info nameofexecutable] \
+			[file normalize $::argv0]]
+	}
+	if {[catch {
+		win32_create_lnk $link_path $cmdLine \
+			[file normalize $_gitworktree]
+	} err]} {
+		error_popup [strcat [mc "Cannot write shortcut:"] "\n\n$err"]
 	}
 }
 
