@@ -22,13 +22,17 @@ proc do_windows_shortcut {} {
 	}
 
 	# Use git-gui.exe if available (ie: git-for-windows)
-	set cmdLine [list [_which git-gui]]
-	if {$cmdLine eq {}} {
-		set cmdLine [list [info nameofexecutable] \
-			[file normalize $::argv0]]
+	set link_target [exec cygpath -m /cmd/git-gui.exe]
+	if {![file executable $link_target]} {
+		set link_target [_which git-gui]
 	}
+	if {![file executable $link_target]} {
+		set link_target [file normalize \
+			[file join [info nameofexecutable] $::argv0]]
+	}
+
 	if {[catch {
-		win32_create_lnk $link_path $cmdLine \
+		win32_create_lnk $link_path $link_target \
 			[file normalize $_gitworktree]
 	} err]} {
 		error_popup [strcat [mc "Cannot write shortcut:"] "\n\n$err"]
