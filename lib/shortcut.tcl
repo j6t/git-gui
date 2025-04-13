@@ -2,7 +2,7 @@
 # Copyright (C) 2006, 2007 Shawn Pearce
 
 proc do_windows_shortcut {} {
-	global _gitworktree
+	global _gitworktree oguilib
 
 	set desktop [exec cygpath -mD]
 	set link_file "Git [reponame].lnk"
@@ -31,9 +31,15 @@ proc do_windows_shortcut {} {
 			[file join [info nameofexecutable] $::argv0]]
 	}
 
+	set repodir [file normalize $_gitworktree]
+	set icon [file normalize [file join $oguilib git-gui.ico]]
 	if {[catch {
-		win32_create_lnk $link_path $link_target \
-			[file normalize $_gitworktree]
+		safe_exec [list create-shortcut \
+			--desktop-shortcut \
+			--work-dir $repodir \
+			--icon-file $icon \
+			$link_target \
+			$link_file]
 	} err]} {
 		error_popup [strcat [mc "Cannot write shortcut:"] "\n\n$err"]
 	}
