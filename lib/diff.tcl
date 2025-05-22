@@ -326,8 +326,7 @@ proc start_show_diff {cont_info {add_opts {}}} {
 	set ::conflict_in_pre_image 0
 	fconfigure $fd \
 		-blocking 0 \
-		-encoding [get_path_encoding $path] \
-		-translation lf
+		-encoding [get_path_encoding $path]
 	fileevent $fd readable [list read_diff $fd $conflict_size $cont_info]
 }
 
