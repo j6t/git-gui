@@ -708,7 +708,13 @@ proc git_write {cmd} {
 }
 
 proc githook_read {hook_name args} {
-	git_read [concat [list hook run --ignore-missing $hook_name --] $args] [list 2>@1]
+	set pchook [gitdir hooks $hook_name]
+
+	if {[file executable $pchook]} {
+		return [safe_open_command [concat [list $pchook] $args] [list 2>@1]]
+	}
+
+	return {}
 }
 
 proc kill_file_process {fd} {
