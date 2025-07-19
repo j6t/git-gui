@@ -2,15 +2,13 @@
 # Copyright (C) 2006, 2007 Shawn Pearce
 
 proc apply_tab_size {{firsttab {}}} {
-	global have_tk85 repo_config ui_diff
+	global repo_config ui_diff
 
 	set w [font measure font_diff "0"]
-	if {$have_tk85 && $firsttab != 0} {
+	if {$firsttab != 0} {
 		$ui_diff configure -tabs [list [expr {$firsttab * $w}] [expr {($firsttab + $repo_config(gui.tabsize)) * $w}]]
-	} elseif {$have_tk85 || $repo_config(gui.tabsize) != 8} {
-		$ui_diff configure -tabs [expr {$repo_config(gui.tabsize) * $w}]
 	} else {
-		$ui_diff configure -tabs {}
+		$ui_diff configure -tabs [expr {$repo_config(gui.tabsize) * $w}]
 	}
 }
 
@@ -193,7 +191,6 @@ proc show_other_diff {path w m cont_info} {
 				file {
 					set fd [safe_open_file $path r]
 					fconfigure $fd \
-						-eofchar {} \
 						-encoding [get_path_encoding $path]
 					set content [read $fd $max_sz]
 					close $fd
@@ -342,8 +339,7 @@ proc start_show_diff {cont_info {add_opts {}}} {
 	set ::conflict_in_pre_image 0
 	fconfigure $fd \
 		-blocking 0 \
-		-encoding [get_path_encoding $path] \
-		-translation lf
+		-encoding [get_path_encoding $path]
 	fileevent $fd readable [list read_diff $fd $conflict_size $cont_info]
 }
 
