@@ -2,27 +2,48 @@
 # Copyright (C) 2006, 2007 Shawn Pearce
 
 proc do_windows_shortcut {} {
-	global _gitworktree
-	set fn [tk_getSaveFile \
-		-parent . \
-		-title [mc "%s (%s): Create Desktop Icon" [appname] [reponame]] \
-		-initialfile "Git [reponame].lnk"]
-	if {$fn != {}} {
-		if {[file extension $fn] ne {.lnk}} {
-			set fn ${fn}.lnk
+	global _gitworktree oguilib
+
+	set desktop [safe_exec [list cygpath -mD]]
+	set link_file "Git [reponame].lnk"
+	set link_path [file normalize [file join $desktop $link_file]]
+
+	# on Windows, tk_getSaveFile dereferences .lnk files, so no simple
+	# filename chooser is available. Use the default or quit.
+	if {[file exists $link_path]} {
+		set answer [tk_messageBox \
+			-type yesno \
+			-title [mc "%s (%s): Create Desktop Icon" [appname] [reponame]] \
+			-default yes \
+			-message [mc "Replace existing shortcut: %s?" $link_file]]
+		if {$answer == no} {
+			return
 		}
-		# Use git-gui.exe if available (ie: git-for-windows)
-		set cmdLine [list [_which git-gui]]
-		if {$cmdLine eq {}} {
-			set cmdLine [list [info nameofexecutable] \
-							 [file normalize $::argv0]]
-		}
-		if {[catch {
-				win32_create_lnk $fn $cmdLine \
-					[file normalize $_gitworktree]
-			} err]} {
-			error_popup [strcat [mc "Cannot write shortcut:"] "\n\n$err"]
-		}
+	}
+
+	# Use git-gui.exe if found, fall back to wish + launcher
+	set link_arguments {}
+	set link_target [safe_exec [list cygpath -m /cmd/git-gui.exe]]
+	if {![file executable $link_target]} {
+		set link_target [_which git-gui]
+	}
+	if {![file executable $link_target]} {
+		set link_target [file normalize [info nameofexecutable]]
+		set link_arguments [string cat {"} [file normalize $::argv0] {"}]
+	}
+
+	set repodir [file normalize $_gitworktree]
+	set icon [file normalize [file join $oguilib git-gui.ico]]
+	if {[catch {
+		safe_exec [list create-shortcut \
+			--arguments $link_arguments \
+			--desktop-shortcut \
+			--icon-file $icon \
+			--work-dir $repodir \
+			$link_target \
+			$link_file]
+	} err]} {
+		error_popup [strcat [mc "Cannot write shortcut:"] "\n\n$err"]
 	}
 }
 

@@ -87,12 +87,6 @@ if {[is_Windows]} {
 	set _search_exe {}
 }
 
-if {[is_Windows]} {
-	set gitguidir [file dirname [info script]]
-	regsub -all ";" $gitguidir "\\;" gitguidir
-	set env(PATH) "$gitguidir;$env(PATH)"
-}
-
 set _search_path {}
 set _path_seen [dict create]
 foreach p [split $env(PATH) $_path_sep] {
@@ -643,8 +637,6 @@ proc _lappend_nice {cmd_var} {
 	if {![info exists _nice]} {
 		set _nice [_which nice]
 		if {[catch {safe_exec [list $_nice git version]}]} {
-			set _nice {}
-		} elseif {[is_Windows] && [file dirname $_nice] ne [file dirname $::_git]} {
 			set _nice {}
 		}
 	}
