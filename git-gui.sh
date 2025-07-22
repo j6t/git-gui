@@ -30,7 +30,7 @@ along with this program; if not, see <https://www.gnu.org/licenses/>.}]
 ##
 ## Tcl/Tk sanity check
 
-if {[catch {package require Tcl 8.6-8.8} err]} {
+if {[catch {package require Tcl 8.6-} err]} {
 	catch {wm withdraw .}
 	tk_messageBox \
 		-icon error \
@@ -71,6 +71,26 @@ proc is_Cygwin {} {
 		}
 	}
 	return $_iscygwin
+}
+
+######################################################################
+## Enable Tcl8 profile in Tcl9, allowing consumption of data that has
+## bytes not conforming to the assumed encoding profile.
+
+if {[package vcompare $::tcl_version 9.0] >= 0} {
+	rename open _strict_open
+	proc open args {
+		set f [_strict_open {*}$args]
+		chan configure $f -profile tcl8
+		return $f
+	}
+	proc convertfrom args {
+		return [encoding convertfrom -profile tcl8 {*}$args]
+	}
+} else {
+	proc convertfrom args {
+		return [encoding convertfrom {*}$args]
+	}
 }
 
 ######################################################################
@@ -183,7 +203,9 @@ if {[is_Windows]} {
 			set command_line [string trim [string range $arg0 1 end]]
 			lset args 0 "| [sanitize_command_line $command_line 0]"
 		}
-		uplevel 1 real_open $args
+		set fd [real_open {*}$args]
+		fconfigure $fd -eofchar {}
+		return $fd
 	}
 
 } else {
@@ -590,7 +612,7 @@ proc git {args} {
 
 proc git_redir {cmd redir} {
 	set fd [git_read $cmd $redir]
-	fconfigure $fd -translation binary -encoding utf-8
+	fconfigure $fd -encoding utf-8
 	set result [string trimright [read $fd] "\n"]
 	close $fd
 	if {$::_trace} {
@@ -607,7 +629,6 @@ proc safe_open_command {cmd {redir {}}} {
 	} err]} {
 		error $err
 	}
-	fconfigure $fd -eofchar {}
 	return $fd
 }
 
@@ -1003,7 +1024,7 @@ proc _parse_config {arr_name args} {
 			[concat config \
 			$args \
 			--null --list]]
-		fconfigure $fd_rc -translation binary -encoding utf-8
+		fconfigure $fd_rc -encoding utf-8
 		set buf [read $fd_rc]
 		close $fd_rc
 	}
@@ -1405,15 +1426,15 @@ proc rescan_stage2 {fd after} {
 	set fd_di [git_read [list diff-index --cached --ignore-submodules=dirty -z [PARENT]]]
 	set fd_df [git_read [list diff-files -z]]
 
-	fconfigure $fd_di -blocking 0 -translation binary -encoding binary
-	fconfigure $fd_df -blocking 0 -translation binary -encoding binary
+	fconfigure $fd_di -blocking 0 -translation binary
+	fconfigure $fd_df -blocking 0 -translation binary
 
 	fileevent $fd_di readable [list read_diff_index $fd_di $after]
 	fileevent $fd_df readable [list read_diff_files $fd_df $after]
 
 	if {[is_config_true gui.displayuntracked]} {
 		set fd_lo [git_read [concat ls-files --others -z $ls_others]]
-		fconfigure $fd_lo -blocking 0 -translation binary -encoding binary
+		fconfigure $fd_lo -blocking 0 -translation binary
 		fileevent $fd_lo readable [list read_ls_others $fd_lo $after]
 		incr rescan_active
 	}
@@ -1427,7 +1448,6 @@ proc load_message {file {encoding {}}} {
 		if {[catch {set fd [safe_open_file $f r]}]} {
 			return 0
 		}
-		fconfigure $fd -eofchar {}
 		if {$encoding ne {}} {
 			fconfigure $fd -encoding $encoding
 		}
@@ -1484,7 +1504,7 @@ proc run_prepare_commit_msg_hook {} {
 	ui_status [mc "Calling prepare-commit-msg hook..."]
 	set pch_error {}
 
-	fconfigure $fd_ph -blocking 0 -translation binary -eofchar {}
+	fconfigure $fd_ph -blocking 0 -translation binary
 	fileevent $fd_ph readable \
 		[list prepare_commit_msg_hook_wait $fd_ph]
 
@@ -1530,7 +1550,7 @@ proc read_diff_index {fd after} {
 		set i [split [string range $buf_rdi $c [expr {$z1 - 2}]] { }]
 		set p [string range $buf_rdi $z1 [expr {$z2 - 1}]]
 		merge_state \
-			[encoding convertfrom utf-8 $p] \
+			[convertfrom utf-8 $p] \
 			[lindex $i 4]? \
 			[list [lindex $i 0] [lindex $i 2]] \
 			[list]
@@ -1563,7 +1583,7 @@ proc read_diff_files {fd after} {
 		set i [split [string range $buf_rdf $c [expr {$z1 - 2}]] { }]
 		set p [string range $buf_rdf $z1 [expr {$z2 - 1}]]
 		merge_state \
-			[encoding convertfrom utf-8 $p] \
+			[convertfrom utf-8 $p] \
 			?[lindex $i 4] \
 			[list] \
 			[list [lindex $i 0] [lindex $i 2]]
@@ -1586,7 +1606,7 @@ proc read_ls_others {fd after} {
 	set pck [split $buf_rlo "\0"]
 	set buf_rlo [lindex $pck end]
 	foreach p [lrange $pck 0 end-1] {
-		set p [encoding convertfrom utf-8 $p]
+		set p [convertfrom utf-8 $p]
 		if {[string index $p end] eq {/}} {
 			set p [string range $p 0 end-1]
 		}
