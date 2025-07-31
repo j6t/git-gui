@@ -1114,7 +1114,9 @@ citool {
 
 # Suggest our implementation of askpass, if none is set
 if {![info exists env(SSH_ASKPASS)]} {
-	set env(SSH_ASKPASS) [file join [git --exec-path] git-gui--askpass]
+	set env(SSH_ASKPASS) \
+		[file join [file dirname [file normalize $::argv0]] \
+			git-gui--askpass]
 }
 
 ######################################################################
