@@ -93,7 +93,7 @@ method _start {} {
 	set spec [$w_rev get_tracking_branch]
 	set cmit [$w_rev get_commit]
 
-	set fh [open [gitdir FETCH_HEAD] w]
+	set fh [safe_open_file [gitdir FETCH_HEAD] w]
 	fconfigure $fh -translation lf
 	if {$spec eq {}} {
 		set remote .
@@ -112,16 +112,7 @@ method _start {} {
 	close $fh
 	set _last_merged_branch $branch
 
-	if {[git-version >= "2.5.0"]} {
-		set cmd [list git merge --strategy=recursive FETCH_HEAD]
-	} else {
-		set cmd [list git]
-		lappend cmd merge
-		lappend cmd --strategy=recursive
-		lappend cmd [git fmt-merge-msg <[gitdir FETCH_HEAD]]
-		lappend cmd HEAD
-		lappend cmd $name
-	}
+	set cmd [list git merge --strategy=recursive FETCH_HEAD]
 
 	ui_status [mc "Merging %s and %s..." $current_branch $stitle]
 	set cons [console::new [mc "Merge"] "merge $stitle"]
@@ -145,7 +136,7 @@ method _finish {cons ok} {
 
 constructor dialog {} {
 	global current_branch
-	global M1B use_ttk NS
+	global M1B
 
 	if {![_can_merge $this]} {
 		delete_this
@@ -160,21 +151,21 @@ constructor dialog {} {
 
 	set _start [cb _start]
 
-	${NS}::label $w.header \
+	ttk::label $w.header \
 		-text [mc "Merge Into %s" $current_branch] \
 		-font font_uibold
 	pack $w.header -side top -fill x
 
-	${NS}::frame $w.buttons
-	${NS}::button $w.buttons.visualize \
+	ttk::frame $w.buttons
+	ttk::button $w.buttons.visualize \
 		-text [mc Visualize] \
 		-command [cb _visualize]
 	pack $w.buttons.visualize -side left
-	${NS}::button $w.buttons.merge \
+	ttk::button $w.buttons.merge \
 		-text [mc Merge] \
 		-command $_start
 	pack $w.buttons.merge -side right
-	${NS}::button $w.buttons.cancel \
+	ttk::button $w.buttons.cancel \
 		-text [mc "Cancel"] \
 		-command [cb _cancel]
 	pack $w.buttons.cancel -side right -padx 5
@@ -239,25 +230,29 @@ Continue with resetting the current changes?"]
 	}
 
 	if {[ask_popup $op_question] eq {yes}} {
-		set fd [git_read --stderr read-tree --reset -u -v HEAD]
+		set fd [git_read [list read-tree --reset -u -v HEAD] [list 2>@1]]
 		fconfigure $fd -blocking 0 -translation binary
-		fileevent $fd readable [namespace code [list _reset_wait $fd]]
-		$::main_status start [mc "Aborting"] [mc "files reset"]
+		set status_bar_operation [$::main_status \
+			start \
+			[mc "Aborting"] \
+			[mc "files reset"]]
+		fileevent $fd readable [namespace code [list \
+			_reset_wait $fd $status_bar_operation]]
 	} else {
 		unlock_index
 	}
 }
 
-proc _reset_wait {fd} {
+proc _reset_wait {fd status_bar_operation} {
 	global ui_comm
 
-	$::main_status update_meter [read $fd]
+	$status_bar_operation update_meter [read $fd]
 
 	fconfigure $fd -blocking 1
 	if {[eof $fd]} {
 		set fail [catch {close $fd} err]
-		$::main_status stop
 		unlock_index
+		$status_bar_operation stop
 
 		$ui_comm delete 0.0 end
 		$ui_comm edit modified false
