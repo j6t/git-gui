@@ -2,15 +2,13 @@
 # Copyright (C) 2006, 2007 Shawn Pearce
 
 proc apply_tab_size {{firsttab {}}} {
-	global have_tk85 repo_config ui_diff
+	global repo_config ui_diff
 
 	set w [font measure font_diff "0"]
-	if {$have_tk85 && $firsttab != 0} {
+	if {$firsttab != 0} {
 		$ui_diff configure -tabs [list [expr {$firsttab * $w}] [expr {($firsttab + $repo_config(gui.tabsize)) * $w}]]
-	} elseif {$have_tk85 || $repo_config(gui.tabsize) != 8} {
-		$ui_diff configure -tabs [expr {$repo_config(gui.tabsize) * $w}]
 	} else {
-		$ui_diff configure -tabs {}
+		$ui_diff configure -tabs [expr {$repo_config(gui.tabsize) * $w}]
 	}
 }
 
@@ -63,28 +61,17 @@ proc force_diff_encoding {enc} {
 }
 
 proc handle_empty_diff {} {
-	global current_diff_path file_states file_lists
-	global diff_empty_count
+	global current_diff_path file_states
+	global ui_diff
 
 	set path $current_diff_path
 	set s $file_states($path)
 	if {[lindex $s 0] ne {_M} || [has_textconv $path]} return
 
-	# Prevent infinite rescan loops
-	incr diff_empty_count
-	if {$diff_empty_count > 1} return
-
-	info_popup [mc "No differences detected.
-
-%s has no changes.
-
-The modification date of this file was updated by another application, but the content within the file was not changed.
-
-A rescan will be automatically started to find other files which may have the same state." [short_path $path]]
-
-	clear_diff
-	display_file $path __
-	rescan ui_ready 0
+	$ui_diff conf -state normal
+	$ui_diff insert end [mc "* No differences detected; stage the file to de-list it from Unstaged Changes.\n"] d_info
+	$ui_diff insert end [mc "* Click to find other files that may have the same state.\n"] d_rescan
+	$ui_diff conf -state disabled
 }
 
 proc show_diff {path w {lno {}} {scroll_pos {}} {callback {}}} {
@@ -202,7 +189,7 @@ proc show_other_diff {path w m cont_info} {
 					set sz [string length $content]
 				}
 				file {
-					set fd [open $path r]
+					set fd [safe_open_file $path r]
 					fconfigure $fd \
 						-eofchar {} \
 						-encoding [get_path_encoding $path]
@@ -226,7 +213,7 @@ proc show_other_diff {path w m cont_info} {
 			$ui_diff insert end \
 				"* [mc "Git Repository (subproject)"]\n" \
 				d_info
-		} elseif {![catch {set type [exec file $path]}]} {
+		} elseif {![catch {set type [safe_exec [list file $path]]}]} {
 			set n [string length $path]
 			if {[string equal -length $n $path $type]} {
 				set type [string range $type $n end]
@@ -270,19 +257,6 @@ proc show_other_diff {path w m cont_info} {
 	}
 }
 
-proc get_conflict_marker_size {path} {
-	set size 7
-	catch {
-		set fd_rc [eval [list git_read check-attr "conflict-marker-size" -- $path]]
-		set ret [gets $fd_rc line]
-		close $fd_rc
-		if {$ret > 0} {
-			regexp {.*: conflict-marker-size: (\d+)$} $line line size
-		}
-	}
-	return $size
-}
-
 proc start_show_diff {cont_info {add_opts {}}} {
 	global file_states file_lists
 	global is_3way_diff is_submodule_diff diff_active repo_config
@@ -298,15 +272,13 @@ proc start_show_diff {cont_info {add_opts {}}} {
 	set is_submodule_diff 0
 	set diff_active 1
 	set current_diff_header {}
-	set conflict_size [get_conflict_marker_size $path]
+	set conflict_size [gitattr $path conflict-marker-size 7]
 
 	set cmd [list]
 	if {$w eq $ui_index} {
 		lappend cmd diff-index
 		lappend cmd --cached
-		if {[git-version >= "1.7.2"]} {
-			lappend cmd --ignore-submodules=dirty
-		}
+		lappend cmd --ignore-submodules=dirty
 	} elseif {$w eq $ui_workdir} {
 		if {[string first {U} $m] >= 0} {
 			lappend cmd diff
@@ -314,17 +286,14 @@ proc start_show_diff {cont_info {add_opts {}}} {
 			lappend cmd diff-files
 		}
 	}
-	if {![is_config_false gui.textconv] && [git-version >= 1.6.1]} {
+	if {![is_config_false gui.textconv]} {
 		lappend cmd --textconv
 	}
 
 	if {[string match {160000 *} [lindex $s 2]]
 	 || [string match {160000 *} [lindex $s 3]]} {
 		set is_submodule_diff 1
-
-		if {[git-version >= "1.6.6"]} {
-			lappend cmd --submodule
-		}
+		lappend cmd --submodule
 	}
 
 	lappend cmd -p
@@ -343,15 +312,7 @@ proc start_show_diff {cont_info {add_opts {}}} {
 		lappend cmd $path
 	}
 
-	if {$is_submodule_diff && [git-version < "1.6.6"]} {
-		if {$w eq $ui_index} {
-			set cmd [list submodule summary --cached -- $path]
-		} else {
-			set cmd [list submodule summary --files -- $path]
-		}
-	}
-
-	if {[catch {set fd [eval git_read --nice $cmd]} err]} {
+	if {[catch {set fd [git_read_nice $cmd]} err]} {
 		set diff_active 0
 		unlock_index
 		ui_status [mc "Unable to display %s" [escape_path $path]]
@@ -360,6 +321,10 @@ proc start_show_diff {cont_info {add_opts {}}} {
 	}
 
 	set ::current_diff_inheader 1
+	# Detect pre-image lines of the diff3 conflict-style. They are just
+	# '++' lines which is not bijective. Thus, we need to maintain a state
+	# across lines.
+	set ::conflict_in_pre_image 0
 	fconfigure $fd \
 		-blocking 0 \
 		-encoding [get_path_encoding $path] \
@@ -396,7 +361,6 @@ proc read_diff {fd conflict_size cont_info} {
 	global ui_diff diff_active is_submodule_diff
 	global is_3way_diff is_conflict_diff current_diff_header
 	global current_diff_queue
-	global diff_empty_count
 
 	$ui_diff conf -state normal
 	while {[gets $fd line] >= 0} {
@@ -462,11 +426,23 @@ proc read_diff {fd conflict_size cont_info} {
 			{--} {set tags d_--}
 			{++} {
 				set regexp [string map [list %conflict_size $conflict_size]\
-								{^\+\+([<>=]){%conflict_size}(?: |$)}]
+								{^\+\+([<>=|]){%conflict_size}(?: |$)}]
 				if {[regexp $regexp $line _g op]} {
 					set is_conflict_diff 1
 					set line [string replace $line 0 1 {  }]
 					set tags d$op
+
+					# The ||| conflict-marker marks the start of the pre-image.
+					# All those lines are also prefixed with '++'. Thus we need
+					# to maintain this state.
+					set ::conflict_in_pre_image [expr {$op eq {|}}]
+				} elseif {$::conflict_in_pre_image} {
+					# This is a pre-image line. It is the one which both sides
+					# are based on. As it has also the '++' line start, it is
+					# normally shown as 'added'. Invert this to '--' to make
+					# it a 'removed' line.
+					set line [string replace $line 0 1 {--}]
+					set tags d_--
 				} else {
 					set tags d_++
 				}
@@ -556,8 +532,6 @@ proc read_diff {fd conflict_size cont_info} {
 
 		if {[$ui_diff index end] eq {2.0}} {
 			handle_empty_diff
-		} else {
-			set diff_empty_count 0
 		}
 
 		set callback [lindex $cont_info 1]
@@ -614,7 +588,7 @@ proc apply_or_revert_hunk {x y revert} {
 
 	if {[catch {
 		set enc [get_path_encoding $current_diff_path]
-		set p [eval git_write $apply_cmd]
+		set p [git_write $apply_cmd]
 		fconfigure $p -translation binary -encoding $enc
 		puts -nonewline $p $wholepatch
 		close $p} err]} {
@@ -850,7 +824,7 @@ proc apply_or_revert_range_or_line {x y revert} {
 
 	if {[catch {
 		set enc [get_path_encoding $current_diff_path]
-		set p [eval git_write $apply_cmd]
+		set p [git_write $apply_cmd]
 		fconfigure $p -translation binary -encoding $enc
 		puts -nonewline $p $current_diff_header
 		puts -nonewline $p $wholepatch
@@ -887,7 +861,7 @@ proc undo_last_revert {} {
 
 	if {[catch {
 		set enc $last_revert_enc
-		set p [eval git_write $apply_cmd]
+		set p [git_write $apply_cmd]
 		fconfigure $p -translation binary -encoding $enc
 		puts -nonewline $p $last_revert
 		close $p} err]} {

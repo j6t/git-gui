@@ -24,15 +24,13 @@ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License
-along with this program; if not, see <http://www.gnu.org/licenses/>.}]
+along with this program; if not, see <https://www.gnu.org/licenses/>.}]
 
 ######################################################################
 ##
 ## Tcl/Tk sanity check
 
-if {[catch {package require Tcl 8.4} err]
- || [catch {package require Tk  8.4} err]
-} {
+if {[catch {package require Tcl 8.6-8.8} err]} {
 	catch {wm withdraw .}
 	tk_messageBox \
 		-icon error \
@@ -43,6 +41,203 @@ if {[catch {package require Tcl 8.4} err]
 }
 
 catch {rename send {}} ; # What an evil concept...
+
+######################################################################
+##
+## Enabling platform-specific code paths
+
+proc is_MacOSX {} {
+	if {[tk windowingsystem] eq {aqua}} {
+		return 1
+	}
+	return 0
+}
+
+proc is_Windows {} {
+	if {$::tcl_platform(platform) eq {windows}} {
+		return 1
+	}
+	return 0
+}
+
+set _iscygwin {}
+proc is_Cygwin {} {
+	global _iscygwin
+	if {$_iscygwin eq {}} {
+		if {[string match "CYGWIN_*" $::tcl_platform(os)]} {
+			set _iscygwin 1
+		} else {
+			set _iscygwin 0
+		}
+	}
+	return $_iscygwin
+}
+
+######################################################################
+##
+## PATH lookup. Sanitize $PATH, assure exec/open use only that
+
+if {[is_Windows]} {
+	set _path_sep {;}
+} else {
+	set _path_sep {:}
+}
+
+set _search_path {}
+set _path_seen [dict create]
+foreach p [split $env(PATH) $_path_sep] {
+	# Keep only absolute paths, getting rid of ., empty, etc.
+	if {[file pathtype $p] ne {absolute}} {
+		continue
+	}
+	# Keep only the first occurence of any duplicates.
+	set norm_p [file normalize $p]
+	if {[dict exists $_path_seen $norm_p]} {
+		continue
+	}
+	dict set _path_seen $norm_p 1
+	lappend _search_path $norm_p
+}
+unset _path_seen
+
+set env(PATH) [join $_search_path $_path_sep]
+
+if {[is_Windows]} {
+	proc _which {what args} {
+		global _search_path
+
+		if {[lsearch -exact $args -script] >= 0} {
+			set suffix {}
+		} elseif {[string match *.exe [string tolower $what]]} {
+			# The search string already has the file extension
+			set suffix {}
+		} else {
+			set suffix .exe
+		}
+
+		foreach p $_search_path {
+			set p [file join $p $what$suffix]
+			if {[file exists $p]} {
+				return [file normalize $p]
+			}
+		}
+		return {}
+	}
+
+	proc sanitize_command_line {command_line from_index} {
+		set i $from_index
+		while {$i < [llength $command_line]} {
+			set cmd [lindex $command_line $i]
+			if {[llength [file split $cmd]] < 2} {
+				set fullpath [_which $cmd]
+				if {$fullpath eq ""} {
+					throw {NOT-FOUND} "$cmd not found in PATH"
+				}
+				lset command_line $i $fullpath
+			}
+
+			# handle piped commands, e.g. `exec A | B`
+			for {incr i} {$i < [llength $command_line]} {incr i} {
+				if {[lindex $command_line $i] eq "|"} {
+					incr i
+					break
+				}
+			}
+		}
+		return $command_line
+	}
+
+	# Override `exec` to avoid unsafe PATH lookup
+
+	rename exec real_exec
+
+	proc exec {args} {
+		# skip options
+		for {set i 0} {$i < [llength $args]} {incr i} {
+			set arg [lindex $args $i]
+			if {$arg eq "--"} {
+				incr i
+				break
+			}
+			if {[string range $arg 0 0] ne "-"} {
+				break
+			}
+		}
+		set args [sanitize_command_line $args $i]
+		uplevel 1 real_exec $args
+	}
+
+	# Override `open` to avoid unsafe PATH lookup
+
+	rename open real_open
+
+	proc open {args} {
+		set arg0 [lindex $args 0]
+		if {[string range $arg0 0 0] eq "|"} {
+			set command_line [string trim [string range $arg0 1 end]]
+			lset args 0 "| [sanitize_command_line $command_line 0]"
+		}
+		uplevel 1 real_open $args
+	}
+
+} else {
+	# On non-Windows platforms, auto_execok, exec, and open are safe, and will
+	# use the sanitized search path. But, we need _which for these.
+
+	proc _which {what args} {
+		return [lindex [auto_execok $what] 0]
+	}
+}
+
+# Wrap exec/open to sanitize arguments
+
+# unsafe arguments begin with redirections or the pipe or background operators
+proc is_arg_unsafe {arg} {
+	regexp {^([<|>&]|2>)} $arg
+}
+
+proc make_arg_safe {arg} {
+	if {[is_arg_unsafe $arg]} {
+		set arg [file join . $arg]
+	}
+	return $arg
+}
+
+proc make_arglist_safe {arglist} {
+	set res {}
+	foreach arg $arglist {
+		lappend res [make_arg_safe $arg]
+	}
+	return $res
+}
+
+# executes one command
+# no redirections or pipelines are possible
+# cmd is a list that specifies the command and its arguments
+# calls `exec` and returns its value
+proc safe_exec {cmd} {
+	eval exec [make_arglist_safe $cmd]
+}
+
+# executes one command in the background
+# no redirections or pipelines are possible
+# cmd is a list that specifies the command and its arguments
+# calls `exec` and returns its value
+proc safe_exec_bg {cmd} {
+	eval exec [make_arglist_safe $cmd] &
+}
+
+proc safe_open_file {filename flags} {
+	# a file name starting with "|" would attempt to run a process
+	# but such a file name must be treated as a relative path
+	# hide the "|" behind "./"
+	if {[string index $filename 0] eq "|"} {
+		set filename [file join . $filename]
+	}
+	open $filename $flags
+}
+
+# End exec/open wrappers
 
 ######################################################################
 ##
@@ -144,11 +339,11 @@ unset oguimsg
 
 if {[tk windowingsystem] eq "aqua"} {
 	catch {
-		exec osascript -e [format {
+		safe_exec [list osascript -e [format {
 			tell application "System Events"
 				set frontmost of processes whose unix id is %d to true
 			end tell
-		} [pid]]
+		} [pid]]]
 	}
 }
 
@@ -160,11 +355,8 @@ set _appname {Git Gui}
 set _gitdir {}
 set _gitworktree {}
 set _isbare {}
-set _gitexec {}
 set _githtmldir {}
 set _reponame {}
-set _iscygwin {}
-set _search_path {}
 set _shellpath {@@SHELL_PATH@@}
 
 set _trace [lsearch -exact $argv --trace]
@@ -180,15 +372,37 @@ if {$_trace >= 0} {
 # branches).
 set _last_merged_branch {}
 
-proc shellpath {} {
-	global _shellpath env
-	if {[string match @@* $_shellpath]} {
-		if {[info exists env(SHELL)]} {
-			return $env(SHELL)
-		} else {
-			return /bin/sh
-		}
+# for testing, allow unconfigured _shellpath
+if {[string match @@* $_shellpath]} {
+	if {[info exists env(SHELL)]} {
+		set _shellpath $env(SHELL)
+	} else {
+		set _shellpath /bin/sh
 	}
+}
+
+if {[is_Windows]} {
+	set _shellpath [safe_exec [list cygpath -m $_shellpath]]
+}
+
+if {![file executable $_shellpath] || \
+	!([file pathtype $_shellpath] eq {absolute})} {
+	set errmsg "The defined shell ('$_shellpath') is not usable, \
+		it must be an absolute path to an executable."
+	puts stderr $errmsg
+
+	catch {wm withdraw .}
+	tk_messageBox \
+		-icon error \
+		-type ok \
+		-title "git-gui: configuration error" \
+		-message $errmsg
+	exit 1
+}
+
+
+proc shellpath {} {
+	global _shellpath
 	return $_shellpath
 }
 
@@ -205,27 +419,6 @@ proc gitdir {args} {
 	return [eval [list file join $_gitdir] $args]
 }
 
-proc gitexec {args} {
-	global _gitexec
-	if {$_gitexec eq {}} {
-		if {[catch {set _gitexec [git --exec-path]} err]} {
-			error "Git not installed?\n\n$err"
-		}
-		if {[is_Cygwin]} {
-			set _gitexec [exec cygpath \
-				--windows \
-				--absolute \
-				$_gitexec]
-		} else {
-			set _gitexec [file normalize $_gitexec]
-		}
-	}
-	if {$args eq {}} {
-		return $_gitexec
-	}
-	return [eval [list file join $_gitexec] $args]
-}
-
 proc githtmldir {args} {
 	global _githtmldir
 	if {$_githtmldir eq {}} {
@@ -233,14 +426,7 @@ proc githtmldir {args} {
 			# Git not installed or option not yet supported
 			return {}
 		}
-		if {[is_Cygwin]} {
-			set _githtmldir [exec cygpath \
-				--windows \
-				--absolute \
-				$_githtmldir]
-		} else {
-			set _githtmldir [file normalize $_githtmldir]
-		}
+		set _githtmldir [file normalize $_githtmldir]
 	}
 	if {$args eq {}} {
 		return $_githtmldir
@@ -250,40 +436,6 @@ proc githtmldir {args} {
 
 proc reponame {} {
 	return $::_reponame
-}
-
-proc is_MacOSX {} {
-	if {[tk windowingsystem] eq {aqua}} {
-		return 1
-	}
-	return 0
-}
-
-proc is_Windows {} {
-	if {$::tcl_platform(platform) eq {windows}} {
-		return 1
-	}
-	return 0
-}
-
-proc is_Cygwin {} {
-	global _iscygwin
-	if {$_iscygwin eq {}} {
-		if {$::tcl_platform(platform) eq {windows}} {
-			if {[catch {set p [exec cygpath --windir]} err]} {
-				set _iscygwin 0
-			} else {
-				set _iscygwin 1
-				# Handle MSys2 which is only cygwin when MSYSTEM is MSYS.
-				if {[info exists ::env(MSYSTEM)] && $::env(MSYSTEM) ne "MSYS"} {
-					set _iscygwin 0
-				}
-			}
-		} else {
-			set _iscygwin 0
-		}
-	}
-	return $_iscygwin
 }
 
 proc is_enabled {option} {
@@ -399,119 +551,13 @@ proc _trace_exec {cmd} {
 
 #'"  fix poor old emacs font-lock mode
 
-proc _git_cmd {name} {
-	global _git_cmd_path
-
-	if {[catch {set v $_git_cmd_path($name)}]} {
-		switch -- $name {
-		  version   -
-		--version   -
-		--exec-path { return [list $::_git $name] }
-		}
-
-		set p [gitexec git-$name$::_search_exe]
-		if {[file exists $p]} {
-			set v [list $p]
-		} elseif {[is_Windows] && [file exists [gitexec git-$name]]} {
-			# Try to determine what sort of magic will make
-			# git-$name go and do its thing, because native
-			# Tcl on Windows doesn't know it.
-			#
-			set p [gitexec git-$name]
-			set f [open $p r]
-			set s [gets $f]
-			close $f
-
-			switch -glob -- [lindex $s 0] {
-			#!*sh     { set i sh     }
-			#!*perl   { set i perl   }
-			#!*python { set i python }
-			default   { error "git-$name is not supported: $s" }
-			}
-
-			upvar #0 _$i interp
-			if {![info exists interp]} {
-				set interp [_which $i]
-			}
-			if {$interp eq {}} {
-				error "git-$name requires $i (not in PATH)"
-			}
-			set v [concat [list $interp] [lrange $s 1 end] [list $p]]
-		} else {
-			# Assume it is builtin to git somehow and we
-			# aren't actually able to see a file for it.
-			#
-			set v [list $::_git $name]
-		}
-		set _git_cmd_path($name) $v
-	}
-	return $v
-}
-
-proc _which {what args} {
-	global env _search_exe _search_path
-
-	if {$_search_path eq {}} {
-		if {[is_Cygwin] && [regexp {^(/|\.:)} $env(PATH)]} {
-			set _search_path [split [exec cygpath \
-				--windows \
-				--path \
-				--absolute \
-				$env(PATH)] {;}]
-			set _search_exe .exe
-		} elseif {[is_Windows]} {
-			set gitguidir [file dirname [info script]]
-			regsub -all ";" $gitguidir "\\;" gitguidir
-			set env(PATH) "$gitguidir;$env(PATH)"
-			set _search_path [split $env(PATH) {;}]
-			set _search_exe .exe
-		} else {
-			set _search_path [split $env(PATH) :]
-			set _search_exe {}
-		}
-	}
-
-	if {[is_Windows] && [lsearch -exact $args -script] >= 0} {
-		set suffix {}
-	} else {
-		set suffix $_search_exe
-	}
-
-	foreach p $_search_path {
-		set p [file join $p $what$suffix]
-		if {[file exists $p]} {
-			return [file normalize $p]
-		}
-	}
-	return {}
-}
-
-# Test a file for a hashbang to identify executable scripts on Windows.
-proc is_shellscript {filename} {
-	if {![file exists $filename]} {return 0}
-	set f [open $filename r]
-	fconfigure $f -encoding binary
-	set magic [read $f 2]
-	close $f
-	return [expr {$magic eq "#!"}]
-}
-
-# Run a command connected via pipes on stdout.
 # This is for use with textconv filters and uses sh -c "..." to allow it to
-# contain a command with arguments. On windows we must check for shell
-# scripts specifically otherwise just call the filter command.
+# contain a command with arguments. We presume this
+# to be a shellscript that the configured shell (/bin/sh by default) knows
+# how to run.
 proc open_cmd_pipe {cmd path} {
-	global env
-	if {![file executable [shellpath]]} {
-		set exe [auto_execok [lindex $cmd 0]]
-		if {[is_shellscript [lindex $exe 0]]} {
-			set run [linsert [auto_execok sh] end -c "$cmd \"\$0\"" $path]
-		} else {
-			set run [concat $exe [lrange $cmd 1 end] $path]
-		}
-	} else {
-		set run [list [shellpath] -c "$cmd \"\$0\"" $path]
-	}
+	set run [list [shellpath] -c "$cmd \"\$0\"" $path]
+	set run [make_arglist_safe $run]
 	return [open |$run r]
 }
 
@@ -521,9 +567,7 @@ proc _lappend_nice {cmd_var} {
 
 	if {![info exists _nice]} {
 		set _nice [_which nice]
-		if {[catch {exec $_nice git version}]} {
-			set _nice {}
-		} elseif {[is_Windows] && [file dirname $_nice] ne [file dirname $::_git]} {
+		if {[catch {safe_exec [list $_nice git version]}]} {
 			set _nice {}
 		}
 	}
@@ -533,7 +577,11 @@ proc _lappend_nice {cmd_var} {
 }
 
 proc git {args} {
-	set fd [eval [list git_read] $args]
+	git_redir $args {}
+}
+
+proc git_redir {cmd redir} {
+	set fd [git_read $cmd $redir]
 	fconfigure $fd -translation binary -encoding utf-8
 	set result [string trimright [read $fd] "\n"]
 	close $fd
@@ -543,111 +591,47 @@ proc git {args} {
 	return $result
 }
 
-proc _open_stdout_stderr {cmd} {
-	_trace_exec $cmd
+proc safe_open_command {cmd {redir {}}} {
+	set cmd [make_arglist_safe $cmd]
+	_trace_exec [concat $cmd $redir]
 	if {[catch {
-			set fd [open [concat [list | ] $cmd] r]
-		} err]} {
-		if {   [lindex $cmd end] eq {2>@1}
-		    && $err eq {can not find channel named "1"}
-			} {
-			# Older versions of Tcl 8.4 don't have this 2>@1 IO
-			# redirect operator.  Fallback to |& cat for those.
-			# The command was not actually started, so its safe
-			# to try to start it a second time.
-			#
-			set fd [open [concat \
-				[list | ] \
-				[lrange $cmd 0 end-1] \
-				[list |& cat] \
-				] r]
-		} else {
-			error $err
-		}
+		set fd [open [concat [list | ] $cmd $redir] r]
+	} err]} {
+		error $err
 	}
 	fconfigure $fd -eofchar {}
 	return $fd
 }
 
-proc git_read {args} {
-	set opt [list]
+proc git_read {cmd {redir {}}} {
+	global _git
+	set cmdp [concat [list $_git] $cmd]
 
-	while {1} {
-		switch -- [lindex $args 0] {
-		--nice {
-			_lappend_nice opt
-		}
-
-		--stderr {
-			lappend args 2>@1
-		}
-
-		default {
-			break
-		}
-
-		}
-
-		set args [lrange $args 1 end]
-	}
-
-	set cmdp [_git_cmd [lindex $args 0]]
-	set args [lrange $args 1 end]
-
-	return [_open_stdout_stderr [concat $opt $cmdp $args]]
+	return [safe_open_command $cmdp $redir]
 }
 
-proc git_write {args} {
+proc git_read_nice {cmd} {
+	global _git
 	set opt [list]
 
-	while {1} {
-		switch -- [lindex $args 0] {
-		--nice {
-			_lappend_nice opt
-		}
+	_lappend_nice opt
 
-		default {
-			break
-		}
+	set cmdp [concat [list $_git] $cmd]
 
-		}
+	return [safe_open_command [concat $opt $cmdp]]
+}
 
-		set args [lrange $args 1 end]
-	}
+proc git_write {cmd} {
+	global _git
+	set cmd [make_arglist_safe $cmd]
+	set cmdp [concat [list $_git] $cmd]
 
-	set cmdp [_git_cmd [lindex $args 0]]
-	set args [lrange $args 1 end]
-
-	_trace_exec [concat $opt $cmdp $args]
-	return [open [concat [list | ] $opt $cmdp $args] w]
+	_trace_exec $cmdp
+	return [open [concat [list | ] $cmdp] w]
 }
 
 proc githook_read {hook_name args} {
-	set pchook [gitdir hooks $hook_name]
-	lappend args 2>@1
-
-	# On Windows [file executable] might lie so we need to ask
-	# the shell if the hook is executable.  Yes that's annoying.
-	#
-	if {[is_Windows]} {
-		upvar #0 _sh interp
-		if {![info exists interp]} {
-			set interp [_which sh]
-		}
-		if {$interp eq {}} {
-			error "hook execution requires sh (not in PATH)"
-		}
-
-		set scr {if test -x "$1";then exec "$@";fi}
-		set sh_c [list $interp -c $scr $interp $pchook]
-		return [_open_stdout_stderr [concat $sh_c $args]]
-	}
-
-	if {[file executable $pchook]} {
-		return [_open_stdout_stderr [concat [list $pchook] $args]]
-	}
-
-	return {}
+	git_read [concat [list hook run --ignore-missing $hook_name --] $args] [list 2>@1]
 }
 
 proc kill_file_process {fd} {
@@ -655,9 +639,9 @@ proc kill_file_process {fd} {
 
 	catch {
 		if {[is_Windows]} {
-			exec taskkill /pid $process
+			safe_exec [list taskkill /pid $process]
 		} else {
-			exec kill $process
+			safe_exec [list kill $process]
 		}
 	}
 }
@@ -683,26 +667,8 @@ proc sq {value} {
 proc load_current_branch {} {
 	global current_branch is_detached
 
-	set fd [open [gitdir HEAD] r]
-	if {[gets $fd ref] < 1} {
-		set ref {}
-	}
-	close $fd
-
-	set pfx {ref: refs/heads/}
-	set len [string length $pfx]
-	if {[string equal -length $len $pfx $ref]} {
-		# We're on a branch.  It might not exist.  But
-		# HEAD looks good enough to be a branch.
-		#
-		set current_branch [string range $ref $len end]
-		set is_detached 0
-	} else {
-		# Assume this is a detached head.
-		#
-		set current_branch HEAD
-		set is_detached 1
-	}
+	set current_branch [git branch --show-current]
+	set is_detached [expr [string length $current_branch] == 0]
 }
 
 auto_load tk_optionMenu
@@ -719,7 +685,6 @@ proc rmsel_tag {text} {
 		-background [$text cget -background] \
 		-foreground [$text cget -foreground] \
 		-borderwidth 0
-	$text tag conf in_sel -background lightgray
 	bind $text <Motion> break
 	return $text
 }
@@ -853,16 +818,14 @@ proc apply_config {} {
 		font configure ${font}italic -slant italic
 	}
 
-	global use_ttk NS
-	set use_ttk 0
-	set NS {}
-	if {$repo_config(gui.usettk)} {
-		set use_ttk [package vsatisfies [package provide Tk] 8.5]
-		if {$use_ttk} {
-			set NS ttk
-			bind [winfo class .] <<ThemeChanged>> [list InitTheme]
-			pave_toplevel .
-		}
+	bind [winfo class .] <<ThemeChanged>> [list InitTheme]
+	pave_toplevel .
+	color::sync_with_theme
+
+	global comment_string
+	set comment_string [get_config core.commentstring]
+	if {$comment_string eq {}} {
+		set comment_string [get_config core.commentchar]
 	}
 }
 
@@ -874,6 +837,8 @@ set default_config(merge.summary) false
 set default_config(merge.verbosity) 2
 set default_config(user.name) {}
 set default_config(user.email) {}
+set default_config(core.commentchar) "#"
+set default_config(core.commentstring) {}
 
 set default_config(gui.encoding) [encoding system]
 set default_config(gui.matchtrackingbranch) false
@@ -922,6 +887,8 @@ if {$_git eq {}} {
 ##
 ## version check
 
+set MIN_GIT_VERSION 2.36
+
 if {[catch {set _git_version [git --version]} err]} {
 	catch {wm withdraw .}
 	tk_messageBox \
@@ -932,9 +899,10 @@ if {[catch {set _git_version [git --version]} err]} {
 
 $err
 
-[appname] requires Git 1.5.0 or later."
+[appname] requires Git $MIN_GIT_VERSION or later."
 	exit 1
 }
+
 if {![regsub {^git version } $_git_version {} _git_version]} {
 	catch {wm withdraw .}
 	tk_messageBox \
@@ -946,105 +914,41 @@ if {![regsub {^git version } $_git_version {} _git_version]} {
 }
 
 proc get_trimmed_version {s} {
-    set r {}
-    foreach x [split $s -._] {
-        if {[string is integer -strict $x]} {
-            lappend r $x
-        } else {
-            break
-        }
-    }
-    return [join $r .]
+	set r {}
+	foreach x [split $s -._] {
+		if {[string is integer -strict $x]} {
+			lappend r $x
+		} else {
+			break
+		}
+	}
+	return [join $r .]
 }
 set _real_git_version $_git_version
 set _git_version [get_trimmed_version $_git_version]
 
-if {![regexp {^[1-9]+(\.[0-9]+)+$} $_git_version]} {
-	catch {wm withdraw .}
-	if {[tk_messageBox \
-		-icon warning \
-		-type yesno \
-		-default no \
-		-title "[appname]: warning" \
-		 -message [mc "Git version cannot be determined.
+if {[catch {set vcheck [package vcompare $_git_version $MIN_GIT_VERSION]}] ||
+	[expr $vcheck < 0] } {
 
-%s claims it is version '%s'.
-
-%s requires at least Git 1.5.0 or later.
-
-Assume '%s' is version 1.5.0?
-" $_git $_real_git_version [appname] $_real_git_version]] eq {yes}} {
-		set _git_version 1.5.0
-	} else {
-		exit 1
-	}
-}
-unset _real_git_version
-
-proc git-version {args} {
-	global _git_version
-
-	switch [llength $args] {
-	0 {
-		return $_git_version
-	}
-
-	2 {
-		set op [lindex $args 0]
-		set vr [lindex $args 1]
-		set cm [package vcompare $_git_version $vr]
-		return [expr $cm $op 0]
-	}
-
-	4 {
-		set type [lindex $args 0]
-		set name [lindex $args 1]
-		set parm [lindex $args 2]
-		set body [lindex $args 3]
-
-		if {($type ne {proc} && $type ne {method})} {
-			error "Invalid arguments to git-version"
-		}
-		if {[llength $body] < 2 || [lindex $body end-1] ne {default}} {
-			error "Last arm of $type $name must be default"
-		}
-
-		foreach {op vr cb} [lrange $body 0 end-2] {
-			if {[git-version $op $vr]} {
-				return [uplevel [list $type $name $parm $cb]]
-			}
-		}
-
-		return [uplevel [list $type $name $parm [lindex $body end]]]
-	}
-
-	default {
-		error "git-version >= x"
-	}
-
-	}
-}
-
-if {[git-version < 1.5]} {
+	set msg1 [mc "Insufficient git version, require: "]
+	set msg2 [mc "git returned:"]
+	set message "$msg1 $MIN_GIT_VERSION\n$msg2 $_real_git_version"
 	catch {wm withdraw .}
 	tk_messageBox \
 		-icon error \
 		-type ok \
 		-title [mc "git-gui: fatal error"] \
-		-message "[appname] requires Git 1.5.0 or later.
-
-You are using [git-version]:
-
-[git --version]"
+		-message $message
 	exit 1
 }
+unset _real_git_version
 
 ######################################################################
 ##
 ## configure our library
 
 set idx [file join $oguilib tclIndex]
-if {[catch {set fd [open $idx r]} err]} {
+if {[catch {set fd [safe_open_file $idx r]} err]} {
 	catch {wm withdraw .}
 	tk_messageBox \
 		-icon error \
@@ -1082,53 +986,30 @@ unset -nocomplain idx fd
 ##
 ## config file parsing
 
-git-version proc _parse_config {arr_name args} {
-	>= 1.5.3 {
-		upvar $arr_name arr
-		array unset arr
-		set buf {}
-		catch {
-			set fd_rc [eval \
-				[list git_read config] \
-				$args \
-				[list --null --list]]
-			fconfigure $fd_rc -translation binary -encoding utf-8
-			set buf [read $fd_rc]
-			close $fd_rc
-		}
-		foreach line [split $buf "\0"] {
-			if {[regexp {^([^\n]+)\n(.*)$} $line line name value]} {
-				if {[is_many_config $name]} {
-					lappend arr($name) $value
-				} else {
-					set arr($name) $value
-				}
-			} elseif {[regexp {^([^\n]+)$} $line line name]} {
-				# no value given, but interpreting them as
-				# boolean will be handled as true
-				set arr($name) {}
-			}
-		}
+proc _parse_config {arr_name args} {
+	upvar $arr_name arr
+	array unset arr
+	set buf {}
+	catch {
+		set fd_rc [git_read \
+			[concat config \
+			$args \
+			--null --list]]
+		fconfigure $fd_rc -translation binary -encoding utf-8
+		set buf [read $fd_rc]
+		close $fd_rc
 	}
-	default {
-		upvar $arr_name arr
-		array unset arr
-		catch {
-			set fd_rc [eval [list git_read config --list] $args]
-			while {[gets $fd_rc line] >= 0} {
-				if {[regexp {^([^=]+)=(.*)$} $line line name value]} {
-					if {[is_many_config $name]} {
-						lappend arr($name) $value
-					} else {
-						set arr($name) $value
-					}
-				} elseif {[regexp {^([^=]+)$} $line line name]} {
-					# no value given, but interpreting them as
-					# boolean will be handled as true
-					set arr($name) {}
-				}
+	foreach line [split $buf "\0"] {
+		if {[regexp {^([^\n]+)\n(.*)$} $line line name value]} {
+			if {[is_many_config $name]} {
+				lappend arr($name) $value
+			} else {
+				set arr($name) $value
 			}
-			close $fd_rc
+		} elseif {[regexp {^([^\n]+)$} $line line name]} {
+			# no value given, but interpreting them as
+			# boolean will be handled as true
+			set arr($name) {}
 		}
 	}
 }
@@ -1223,11 +1104,9 @@ citool {
 ##
 ## execution environment
 
-set have_tk85 [expr {[package vcompare $tk_version "8.5"] >= 0}]
-
 # Suggest our implementation of askpass, if none is set
 if {![info exists env(SSH_ASKPASS)]} {
-	set env(SSH_ASKPASS) [gitexec git-gui--askpass]
+	set env(SSH_ASKPASS) [file join [git --exec-path] git-gui--askpass]
 }
 if {![info exists env(GIT_ASKPASS)]} {
 	set env(GIT_ASKPASS) [gitexec git-gui--askpass]
@@ -1254,7 +1133,21 @@ if {[catch {
 	load_config 1
 	apply_config
 	choose_repository::pick
+	if {![file isdirectory $_gitdir]} {
+		exit 1
+	}
 	set picked 1
+}
+
+# Use object format as hash algorithm (either "sha1" or "sha256")
+set hashalgorithm [git rev-parse --show-object-format]
+if {$hashalgorithm eq "sha1"} {
+	set hashlength 40
+} elseif {$hashalgorithm eq "sha256"} {
+	set hashlength 64
+} else {
+	puts stderr "Unknown hash algorithm: $hashalgorithm"
+	exit 1
 }
 
 # we expand the _gitdir when it's just a single dot (i.e. when we're being
@@ -1264,9 +1157,6 @@ if {$_gitdir eq "."} {
 	set _gitdir [pwd]
 }
 
-if {![file isdirectory $_gitdir] && [is_Cygwin]} {
-	catch {set _gitdir [exec cygpath --windows $_gitdir]}
-}
 if {![file isdirectory $_gitdir]} {
 	catch {wm withdraw .}
 	error_popup [strcat [mc "Git directory not found:"] "\n\n$_gitdir"]
@@ -1276,24 +1166,7 @@ if {![file isdirectory $_gitdir]} {
 load_config 0
 apply_config
 
-# v1.7.0 introduced --show-toplevel to return the canonical work-tree
-if {[package vcompare $_git_version 1.7.0] >= 0} {
-	if { [is_Cygwin] } {
-		catch {set _gitworktree [exec cygpath --windows [git rev-parse --show-toplevel]]}
-	} else {
-		set _gitworktree [git rev-parse --show-toplevel]
-	}
-} else {
-	# try to set work tree from environment, core.worktree or use
-	# cdup to obtain a relative path to the top of the worktree. If
-	# run from the top, the ./ prefix ensures normalize expands pwd.
-	if {[catch { set _gitworktree $env(GIT_WORK_TREE) }]} {
-		set _gitworktree [get_config core.worktree]
-		if {$_gitworktree eq ""} {
-			set _gitworktree [file normalize ./[git rev-parse --show-cdup]]
-		}
-	}
-}
+set _gitworktree [git rev-parse --show-toplevel]
 
 if {$_prefix ne {}} {
 	if {$_gitworktree eq {}} {
@@ -1354,12 +1227,11 @@ set current_diff_path {}
 set is_3way_diff 0
 set is_submodule_diff 0
 set is_conflict_diff 0
-set diff_empty_count 0
 set last_revert {}
 set last_revert_enc {}
 
-set nullid "0000000000000000000000000000000000000000"
-set nullid2 "0000000000000000000000000000000000000001"
+set nullid [string repeat 0 $hashlength]
+set nullid2 "[string repeat 0 [expr $hashlength - 1]]1"
 
 ######################################################################
 ##
@@ -1417,7 +1289,7 @@ proc repository_state {ctvar hdvar mhvar} {
 	set merge_head [gitdir MERGE_HEAD]
 	if {[file exists $merge_head]} {
 		set ct merge
-		set fd_mh [open $merge_head r]
+		set fd_mh [safe_open_file $merge_head r]
 		while {[gets $fd_mh line] >= 0} {
 			lappend mh $line
 		}
@@ -1436,7 +1308,7 @@ proc PARENT {} {
 		return $p
 	}
 	if {$empty_tree eq {}} {
-		set empty_tree [git mktree << {}]
+		set empty_tree [git_redir [list mktree] [list << {}]]
 	}
 	return $empty_tree
 }
@@ -1484,6 +1356,7 @@ proc rescan {after {honor_trustmtime 1}} {
 		} elseif {[run_prepare_commit_msg_hook]} {
 		} elseif {[load_message MERGE_MSG]} {
 		} elseif {[load_message SQUASH_MSG]} {
+		} elseif {[load_message [get_config commit.template]]} {
 		}
 		$ui_comm edit reset
 		$ui_comm edit modified false
@@ -1494,36 +1367,20 @@ proc rescan {after {honor_trustmtime 1}} {
 	} else {
 		set rescan_active 1
 		ui_status [mc "Refreshing file status..."]
-		set fd_rf [git_read update-index \
+		set fd_rf [git_read [list update-index \
 			-q \
 			--unmerged \
 			--ignore-missing \
 			--refresh \
-			]
+			]]
 		fconfigure $fd_rf -blocking 0 -translation binary
 		fileevent $fd_rf readable \
 			[list rescan_stage2 $fd_rf $after]
 	}
 }
 
-if {[is_Cygwin]} {
-	set is_git_info_exclude {}
-	proc have_info_exclude {} {
-		global is_git_info_exclude
-
-		if {$is_git_info_exclude eq {}} {
-			if {[catch {exec test -f [gitdir info exclude]}]} {
-				set is_git_info_exclude 0
-			} else {
-				set is_git_info_exclude 1
-			}
-		}
-		return $is_git_info_exclude
-	}
-} else {
-	proc have_info_exclude {} {
-		return [file readable [gitdir info exclude]]
-	}
+proc have_info_exclude {} {
+	return [file readable [gitdir info exclude]]
 }
 
 proc rescan_stage2 {fd after} {
@@ -1535,18 +1392,7 @@ proc rescan_stage2 {fd after} {
 		close $fd
 	}
 
-	if {[package vcompare $::_git_version 1.6.3] >= 0} {
-		set ls_others [list --exclude-standard]
-	} else {
-		set ls_others [list --exclude-per-directory=.gitignore]
-		if {[have_info_exclude]} {
-			lappend ls_others "--exclude-from=[gitdir info exclude]"
-		}
-		set user_exclude [get_config core.excludesfile]
-		if {$user_exclude ne {} && [file readable $user_exclude]} {
-			lappend ls_others "--exclude-from=[file normalize $user_exclude]"
-		}
-	}
+	set ls_others [list --exclude-standard]
 
 	set buf_rdi {}
 	set buf_rdf {}
@@ -1554,12 +1400,8 @@ proc rescan_stage2 {fd after} {
 
 	set rescan_active 2
 	ui_status [mc "Scanning for modified files ..."]
-	if {[git-version >= "1.7.2"]} {
-		set fd_di [git_read diff-index --cached --ignore-submodules=dirty -z [PARENT]]
-	} else {
-		set fd_di [git_read diff-index --cached -z [PARENT]]
-	}
-	set fd_df [git_read diff-files -z]
+	set fd_di [git_read [list diff-index --cached --ignore-submodules=dirty -z [PARENT]]]
+	set fd_df [git_read [list diff-files -z]]
 
 	fconfigure $fd_di -blocking 0 -translation binary -encoding binary
 	fconfigure $fd_df -blocking 0 -translation binary -encoding binary
@@ -1568,7 +1410,7 @@ proc rescan_stage2 {fd after} {
 	fileevent $fd_df readable [list read_diff_files $fd_df $after]
 
 	if {[is_config_true gui.displayuntracked]} {
-		set fd_lo [eval git_read ls-files --others -z $ls_others]
+		set fd_lo [git_read [concat ls-files --others -z $ls_others]]
 		fconfigure $fd_lo -blocking 0 -translation binary -encoding binary
 		fileevent $fd_lo readable [list read_ls_others $fd_lo $after]
 		incr rescan_active
@@ -1580,7 +1422,7 @@ proc load_message {file {encoding {}}} {
 
 	set f [gitdir $file]
 	if {[file isfile $f]} {
-		if {[catch {set fd [open $f r]}]} {
+		if {[catch {set fd [safe_open_file $f r]}]} {
 			return 0
 		}
 		fconfigure $fd -eofchar {}
@@ -1604,17 +1446,23 @@ proc run_prepare_commit_msg_hook {} {
 	# it will be .git/MERGE_MSG (merge), .git/SQUASH_MSG (squash), or an
 	# empty file but existent file.
 
-	set fd_pcm [open [gitdir PREPARE_COMMIT_MSG] a]
+	set fd_pcm [safe_open_file [gitdir PREPARE_COMMIT_MSG] a]
 
 	if {[file isfile [gitdir MERGE_MSG]]} {
 		set pcm_source "merge"
-		set fd_mm [open [gitdir MERGE_MSG] r]
+		set fd_mm [safe_open_file [gitdir MERGE_MSG] r]
 		fconfigure $fd_mm -encoding utf-8
 		puts -nonewline $fd_pcm [read $fd_mm]
 		close $fd_mm
 	} elseif {[file isfile [gitdir SQUASH_MSG]]} {
 		set pcm_source "squash"
-		set fd_sm [open [gitdir SQUASH_MSG] r]
+		set fd_sm [safe_open_file [gitdir SQUASH_MSG] r]
+		fconfigure $fd_sm -encoding utf-8
+		puts -nonewline $fd_pcm [read $fd_sm]
+		close $fd_sm
+	} elseif {[file isfile [get_config commit.template]]} {
+		set pcm_source "template"
+		set fd_sm [safe_open_file [get_config commit.template] r]
 		fconfigure $fd_sm -encoding utf-8
 		puts -nonewline $fd_pcm [read $fd_sm]
 		close $fd_sm
@@ -1658,7 +1506,7 @@ proc prepare_commit_msg_hook_wait {fd_ph} {
 		set pch_error {}
 		catch {file delete [gitdir PREPARE_COMMIT_MSG]}
 		return
-        }
+	}
 	fconfigure $fd_ph -blocking 0
 	catch {file delete [gitdir PREPARE_COMMIT_MSG]}
 }
@@ -1803,10 +1651,10 @@ proc ui_status {msg} {
 	}
 }
 
-proc ui_ready {{test {}}} {
+proc ui_ready {} {
 	global main_status
 	if {[info exists main_status]} {
-		$main_status show [mc "Ready."] $test
+		$main_status show [mc "Ready."]
 	}
 }
 
@@ -1821,10 +1669,9 @@ proc short_path {path} {
 }
 
 set next_icon_id 0
-set null_sha1 [string repeat 0 40]
 
 proc merge_state {path new_state {head_info {}} {index_info {}}} {
-	global file_states next_icon_id null_sha1
+	global file_states next_icon_id nullid
 
 	set s0 [string index $new_state 0]
 	set s1 [string index $new_state 1]
@@ -1846,7 +1693,7 @@ proc merge_state {path new_state {head_info {}} {index_info {}}} {
 	elseif {$s1 eq {_}} {set s1 _}
 
 	if {$s0 eq {A} && $s1 eq {_} && $head_info eq {}} {
-		set head_info [list 0 $null_sha1]
+		set head_info [list 0 $nullid]
 	} elseif {$s0 ne {_} && [string index $state 0] eq {_}
 		&& $head_info eq {}} {
 		set head_info $index_info
@@ -2006,72 +1853,72 @@ set filemask {
 #define mask_width 14
 #define mask_height 15
 static unsigned char mask_bits[] = {
-   0xfe, 0x1f, 0xfe, 0x1f, 0xfe, 0x1f, 0xfe, 0x1f, 0xfe, 0x1f, 0xfe, 0x1f,
-   0xfe, 0x1f, 0xfe, 0x1f, 0xfe, 0x1f, 0xfe, 0x1f, 0xfe, 0x1f, 0xfe, 0x1f,
-   0xfe, 0x1f, 0xfe, 0x1f, 0xfe, 0x1f};
+	0xfe, 0x1f, 0xfe, 0x1f, 0xfe, 0x1f, 0xfe, 0x1f, 0xfe, 0x1f, 0xfe, 0x1f,
+	0xfe, 0x1f, 0xfe, 0x1f, 0xfe, 0x1f, 0xfe, 0x1f, 0xfe, 0x1f, 0xfe, 0x1f,
+	0xfe, 0x1f, 0xfe, 0x1f, 0xfe, 0x1f};
 }
 
 image create bitmap file_plain -background white -foreground black -data {
 #define plain_width 14
 #define plain_height 15
 static unsigned char plain_bits[] = {
-   0xfe, 0x01, 0x02, 0x03, 0x02, 0x05, 0x02, 0x09, 0x02, 0x1f, 0x02, 0x10,
-   0x02, 0x10, 0x02, 0x10, 0x02, 0x10, 0x02, 0x10, 0x02, 0x10, 0x02, 0x10,
-   0x02, 0x10, 0x02, 0x10, 0xfe, 0x1f};
+	0xfe, 0x01, 0x02, 0x03, 0x02, 0x05, 0x02, 0x09, 0x02, 0x1f, 0x02, 0x10,
+	0x02, 0x10, 0x02, 0x10, 0x02, 0x10, 0x02, 0x10, 0x02, 0x10, 0x02, 0x10,
+	0x02, 0x10, 0x02, 0x10, 0xfe, 0x1f};
 } -maskdata $filemask
 
 image create bitmap file_mod -background white -foreground blue -data {
 #define mod_width 14
 #define mod_height 15
 static unsigned char mod_bits[] = {
-   0xfe, 0x01, 0x02, 0x03, 0x7a, 0x05, 0x02, 0x09, 0x7a, 0x1f, 0x02, 0x10,
-   0xfa, 0x17, 0x02, 0x10, 0xfa, 0x17, 0x02, 0x10, 0xfa, 0x17, 0x02, 0x10,
-   0xfa, 0x17, 0x02, 0x10, 0xfe, 0x1f};
+	0xfe, 0x01, 0x02, 0x03, 0x7a, 0x05, 0x02, 0x09, 0x7a, 0x1f, 0x02, 0x10,
+	0xfa, 0x17, 0x02, 0x10, 0xfa, 0x17, 0x02, 0x10, 0xfa, 0x17, 0x02, 0x10,
+	0xfa, 0x17, 0x02, 0x10, 0xfe, 0x1f};
 } -maskdata $filemask
 
 image create bitmap file_fulltick -background white -foreground "#007000" -data {
 #define file_fulltick_width 14
 #define file_fulltick_height 15
 static unsigned char file_fulltick_bits[] = {
-   0xfe, 0x01, 0x02, 0x1a, 0x02, 0x0c, 0x02, 0x0c, 0x02, 0x16, 0x02, 0x16,
-   0x02, 0x13, 0x00, 0x13, 0x86, 0x11, 0x8c, 0x11, 0xd8, 0x10, 0xf2, 0x10,
-   0x62, 0x10, 0x02, 0x10, 0xfe, 0x1f};
+	0xfe, 0x01, 0x02, 0x1a, 0x02, 0x0c, 0x02, 0x0c, 0x02, 0x16, 0x02, 0x16,
+	0x02, 0x13, 0x00, 0x13, 0x86, 0x11, 0x8c, 0x11, 0xd8, 0x10, 0xf2, 0x10,
+	0x62, 0x10, 0x02, 0x10, 0xfe, 0x1f};
 } -maskdata $filemask
 
 image create bitmap file_question -background white -foreground black -data {
 #define file_question_width 14
 #define file_question_height 15
 static unsigned char file_question_bits[] = {
-   0xfe, 0x01, 0x02, 0x02, 0xe2, 0x04, 0xf2, 0x09, 0x1a, 0x1b, 0x0a, 0x13,
-   0x82, 0x11, 0xc2, 0x10, 0x62, 0x10, 0x62, 0x10, 0x02, 0x10, 0x62, 0x10,
-   0x62, 0x10, 0x02, 0x10, 0xfe, 0x1f};
+	0xfe, 0x01, 0x02, 0x02, 0xe2, 0x04, 0xf2, 0x09, 0x1a, 0x1b, 0x0a, 0x13,
+	0x82, 0x11, 0xc2, 0x10, 0x62, 0x10, 0x62, 0x10, 0x02, 0x10, 0x62, 0x10,
+	0x62, 0x10, 0x02, 0x10, 0xfe, 0x1f};
 } -maskdata $filemask
 
 image create bitmap file_removed -background white -foreground red -data {
 #define file_removed_width 14
 #define file_removed_height 15
 static unsigned char file_removed_bits[] = {
-   0xfe, 0x01, 0x02, 0x03, 0x02, 0x05, 0x02, 0x09, 0x02, 0x1f, 0x02, 0x10,
-   0x1a, 0x16, 0x32, 0x13, 0xe2, 0x11, 0xc2, 0x10, 0xe2, 0x11, 0x32, 0x13,
-   0x1a, 0x16, 0x02, 0x10, 0xfe, 0x1f};
+	0xfe, 0x01, 0x02, 0x03, 0x02, 0x05, 0x02, 0x09, 0x02, 0x1f, 0x02, 0x10,
+	0x1a, 0x16, 0x32, 0x13, 0xe2, 0x11, 0xc2, 0x10, 0xe2, 0x11, 0x32, 0x13,
+	0x1a, 0x16, 0x02, 0x10, 0xfe, 0x1f};
 } -maskdata $filemask
 
 image create bitmap file_merge -background white -foreground blue -data {
 #define file_merge_width 14
 #define file_merge_height 15
 static unsigned char file_merge_bits[] = {
-   0xfe, 0x01, 0x02, 0x03, 0x62, 0x05, 0x62, 0x09, 0x62, 0x1f, 0x62, 0x10,
-   0xfa, 0x11, 0xf2, 0x10, 0x62, 0x10, 0x02, 0x10, 0xfa, 0x17, 0x02, 0x10,
-   0xfa, 0x17, 0x02, 0x10, 0xfe, 0x1f};
+	0xfe, 0x01, 0x02, 0x03, 0x62, 0x05, 0x62, 0x09, 0x62, 0x1f, 0x62, 0x10,
+	0xfa, 0x11, 0xf2, 0x10, 0x62, 0x10, 0x02, 0x10, 0xfa, 0x17, 0x02, 0x10,
+	0xfa, 0x17, 0x02, 0x10, 0xfe, 0x1f};
 } -maskdata $filemask
 
 image create bitmap file_statechange -background white -foreground green -data {
 #define file_statechange_width 14
 #define file_statechange_height 15
 static unsigned char file_statechange_bits[] = {
-   0xfe, 0x01, 0x02, 0x03, 0x02, 0x05, 0x02, 0x09, 0x02, 0x1f, 0x62, 0x10,
-   0x62, 0x10, 0xba, 0x11, 0xba, 0x11, 0x62, 0x10, 0x62, 0x10, 0x02, 0x10,
-   0x02, 0x10, 0x02, 0x10, 0xfe, 0x1f};
+	0xfe, 0x01, 0x02, 0x03, 0x02, 0x05, 0x02, 0x09, 0x02, 0x1f, 0x62, 0x10,
+	0x62, 0x10, 0xba, 0x11, 0xba, 0x11, 0x62, 0x10, 0x62, 0x10, 0x02, 0x10,
+	0x02, 0x10, 0x02, 0x10, 0xfe, 0x1f};
 } -maskdata $filemask
 
 set ui_index .vpane.files.index.list
@@ -2156,8 +2003,6 @@ proc incr_font_size {font {amt 1}} {
 ##
 ## ui commands
 
-set starting_gitk_msg [mc "Starting gitk... please wait..."]
-
 proc do_gitk {revs {is_submodule false}} {
 	global current_diff_path file_states current_diff_side ui_index
 	global _gitdir _gitworktree
@@ -2206,15 +2051,18 @@ proc do_gitk {revs {is_submodule false}} {
 			unset env(GIT_DIR)
 			unset env(GIT_WORK_TREE)
 		}
-		eval exec $cmd $revs "--" "--" &
+		safe_exec_bg [concat $cmd $revs "--" "--"]
 
 		set env(GIT_DIR) $_gitdir
 		set env(GIT_WORK_TREE) $_gitworktree
 		cd $pwd
 
-		ui_status $::starting_gitk_msg
-		after 10000 {
-			ui_ready $starting_gitk_msg
+		if {[info exists main_status]} {
+			set status_operation [$::main_status \
+				start \
+				[mc "Starting %s... please wait..." "gitk"]]
+
+			after 3500 [list $status_operation stop]
 		}
 	}
 }
@@ -2240,23 +2088,25 @@ proc do_git_gui {} {
 		set pwd [pwd]
 		cd $current_diff_path
 
-		eval exec $exe gui &
+		safe_exec_bg [concat $exe gui]
 
 		set env(GIT_DIR) $_gitdir
 		set env(GIT_WORK_TREE) $_gitworktree
 		cd $pwd
 
-		ui_status $::starting_gitk_msg
-		after 10000 {
-			ui_ready $starting_gitk_msg
-		}
+		set status_operation [$::main_status \
+			start \
+			[mc "Starting %s... please wait..." "git-gui"]]
+
+		after 3500 [list $status_operation stop]
 	}
 }
 
-proc do_explore {} {
-	global _gitworktree
-	set explorer {}
-	if {[is_Cygwin] || [is_Windows]} {
+# Get the system-specific explorer app/command.
+proc get_explorer {} {
+	if {[is_Cygwin]} {
+		set explorer "/bin/cygstart.exe --explore"
+	} elseif {[is_Windows]} {
 		set explorer "explorer.exe"
 	} elseif {[is_MacOSX]} {
 		set explorer "open"
@@ -2264,7 +2114,23 @@ proc do_explore {} {
 		# freedesktop.org-conforming system is our best shot
 		set explorer "xdg-open"
 	}
-	eval exec $explorer [list [file nativename $_gitworktree]] &
+	return $explorer
+}
+
+proc do_explore {} {
+	global _gitworktree
+	set cmd [get_explorer]
+	lappend cmd [file nativename $_gitworktree]
+	safe_exec_bg $cmd
+}
+
+# Open file relative to the working tree by the default associated app.
+proc do_file_open {file} {
+	global _gitworktree
+	set cmd [get_explorer]
+	set full_file_path [file join $_gitworktree $file]
+	lappend cmd [file nativename $full_file_path]
+	safe_exec_bg $cmd
 }
 
 set is_quitting 0
@@ -2280,7 +2146,7 @@ proc do_quit {{rc {1}}} {
 	global ui_comm is_quitting repo_config commit_type
 	global GITGUI_BCK_exists GITGUI_BCK_i
 	global ui_comm_spell
-	global ret_code use_ttk
+	global ret_code
 
 	if {$is_quitting} return
 	set is_quitting 1
@@ -2290,16 +2156,15 @@ proc do_quit {{rc {1}}} {
 		#
 		set save [gitdir GITGUI_MSG]
 		if {$GITGUI_BCK_exists && ![$ui_comm edit modified]} {
-			file rename -force [gitdir GITGUI_BCK] $save
+			catch { file rename -force [gitdir GITGUI_BCK] $save }
 			set GITGUI_BCK_exists 0
-		} else {
+		} elseif {[$ui_comm edit modified]} {
 			set msg [string trim [$ui_comm get 0.0 end]]
 			regsub -all -line {[ \r\t]+$} $msg {} msg
-			if {(![string match amend* $commit_type]
-				|| [$ui_comm edit modified])
+			if {![string match amend* $commit_type]
 				&& $msg ne {}} {
 				catch {
-					set fd [open $save w]
+					set fd [safe_open_file $save w]
 					fconfigure $fd -encoding utf-8
 					puts -nonewline $fd $msg
 					close $fd
@@ -2339,13 +2204,8 @@ proc do_quit {{rc {1}}} {
 		}
 		set cfg_geometry [list]
 		lappend cfg_geometry [wm geometry .]
-		if {$use_ttk} {
-			lappend cfg_geometry [.vpane sashpos 0]
-			lappend cfg_geometry [.vpane.files sashpos 0]
-		} else {
-			lappend cfg_geometry [lindex [.vpane sash coord 0] 0]
-			lappend cfg_geometry [lindex [.vpane.files sash coord 0] 1]
-		}
+		lappend cfg_geometry [.vpane sashpos 0]
+		lappend cfg_geometry [.vpane.files sashpos 0]
 		if {[catch {set rc_geometry $repo_config(gui.geometry)}]} {
 			set rc_geometry {}
 		}
@@ -2357,7 +2217,7 @@ proc do_quit {{rc {1}}} {
 	set ret_code $rc
 
 	# Briefly enable send again, working around Tk bug
-	# http://sourceforge.net/tracker/?func=detail&atid=112997&aid=1821174&group_id=12997
+	# https://sourceforge.net/p/tktoolkit/bugs/2343/
 	tk appname [appname]
 
 	destroy .
@@ -2590,12 +2450,12 @@ proc toggle_or_diff {mode w args} {
 			update_indexinfo \
 				"Unstaging [short_path $path] from commit" \
 				[list $path] \
-				[concat $after [list ui_ready]]
+				[concat $after {ui_ready;}]
 		} elseif {$w eq $ui_workdir} {
 			update_index \
 				"Adding [short_path $path]" \
 				[list $path] \
-				[concat $after [list ui_ready]]
+				[concat $after {ui_ready;}]
 		}
 	} else {
 		set selected_paths($path) 1
@@ -2742,10 +2602,17 @@ if {![is_bare]} {
 }
 
 if {[is_Windows]} {
+	# Use /git-bash.exe if available
+	set _git_bash [safe_exec [list cygpath -m /git-bash.exe]]
+	if {[file executable $_git_bash]} {
+		set _bash_cmdline [list "Git Bash" $_git_bash]
+	} else {
+		set _bash_cmdline [list "Git Bash" bash --login -l]
+	}
 	.mbar.repository add command \
 		-label [mc "Git Bash"] \
-		-command {eval exec [auto_execok start] \
-					  [list "Git Bash" bash --login -l &]}
+		-command {safe_exec_bg [concat [list [_which cmd] /c start] $_bash_cmdline]}
+	unset _git_bash
 }
 
 if {[is_Windows] || ![is_bare]} {
@@ -3029,16 +2896,12 @@ if {[is_MacOSX]} {
 set doc_path [githtmldir]
 if {$doc_path ne {}} {
 	set doc_path [file join $doc_path index.html]
-
-	if {[is_Cygwin]} {
-		set doc_path [exec cygpath --mixed $doc_path]
-	}
 }
 
 if {[file isfile $doc_path]} {
 	set doc_url "file:$doc_path"
 } else {
-	set doc_url {http://www.kernel.org/pub/software/scm/git/docs/}
+	set doc_url {https://www.kernel.org/pub/software/scm/git/docs/}
 }
 
 proc start_browser {url} {
@@ -3158,7 +3021,7 @@ blame {
 	if {$head eq {}} {
 		load_current_branch
 	} else {
-		if {[regexp {^[0-9a-f]{1,39}$} $head]} {
+		if {[regexp [string map "@@ [expr $hashlength - 1]" {^[0-9a-f]{1,@@}$}] $head]} {
 			if {[catch {
 					set head [git rev-parse --verify $head]
 				} err]} {
@@ -3224,13 +3087,12 @@ default {
 
 # -- Branch Control
 #
-${NS}::frame .branch
-if {!$use_ttk} {.branch configure -borderwidth 1 -relief sunken}
-${NS}::label .branch.l1 \
+ttk::frame .branch
+ttk::label .branch.l1 \
 	-text [mc "Current Branch:"] \
 	-anchor w \
 	-justify left
-${NS}::label .branch.cb \
+ttk::label .branch.cb \
 	-textvariable current_branch \
 	-anchor w \
 	-justify left
@@ -3240,13 +3102,9 @@ pack .branch -side top -fill x
 
 # -- Main Window Layout
 #
-${NS}::panedwindow .vpane -orient horizontal
-${NS}::panedwindow .vpane.files -orient vertical
-if {$use_ttk} {
-	.vpane add .vpane.files
-} else {
-	.vpane add .vpane.files -sticky nsew -height 100 -width 200
-}
+ttk::panedwindow .vpane -orient horizontal
+ttk::panedwindow .vpane.files -orient vertical
+.vpane add .vpane.files
 pack .vpane -anchor n -side top -fill both -expand 1
 
 # -- Working Directory File List
@@ -3254,7 +3112,7 @@ pack .vpane -anchor n -side top -fill both -expand 1
 textframe .vpane.files.workdir -height 100 -width 200
 tlabel .vpane.files.workdir.title -text [mc "Unstaged Changes"] \
 	-background lightsalmon -foreground black
-ttext $ui_workdir -background white -foreground black \
+ttext $ui_workdir \
 	-borderwidth 0 \
 	-width 20 -height 10 \
 	-wrap none \
@@ -3263,8 +3121,8 @@ ttext $ui_workdir -background white -foreground black \
 	-xscrollcommand {.vpane.files.workdir.sx set} \
 	-yscrollcommand {.vpane.files.workdir.sy set} \
 	-state disabled
-${NS}::scrollbar .vpane.files.workdir.sx -orient h -command [list $ui_workdir xview]
-${NS}::scrollbar .vpane.files.workdir.sy -orient v -command [list $ui_workdir yview]
+ttk::scrollbar .vpane.files.workdir.sx -orient h -command [list $ui_workdir xview]
+ttk::scrollbar .vpane.files.workdir.sy -orient v -command [list $ui_workdir yview]
 pack .vpane.files.workdir.title -side top -fill x
 pack .vpane.files.workdir.sx -side bottom -fill x
 pack .vpane.files.workdir.sy -side right -fill y
@@ -3276,7 +3134,7 @@ textframe .vpane.files.index -height 100 -width 200
 tlabel .vpane.files.index.title \
 	-text [mc "Staged Changes (Will Commit)"] \
 	-background lightgreen -foreground black
-ttext $ui_index -background white -foreground black \
+ttext $ui_index \
 	-borderwidth 0 \
 	-width 20 -height 10 \
 	-wrap none \
@@ -3285,8 +3143,8 @@ ttext $ui_index -background white -foreground black \
 	-xscrollcommand {.vpane.files.index.sx set} \
 	-yscrollcommand {.vpane.files.index.sy set} \
 	-state disabled
-${NS}::scrollbar .vpane.files.index.sx -orient h -command [list $ui_index xview]
-${NS}::scrollbar .vpane.files.index.sy -orient v -command [list $ui_index yview]
+ttk::scrollbar .vpane.files.index.sx -orient h -command [list $ui_index xview]
+ttk::scrollbar .vpane.files.index.sy -orient v -command [list $ui_index yview]
 pack .vpane.files.index.title -side top -fill x
 pack .vpane.files.index.sx -side bottom -fill x
 pack .vpane.files.index.sy -side right -fill y
@@ -3296,91 +3154,83 @@ pack $ui_index -side left -fill both -expand 1
 #
 .vpane.files add .vpane.files.workdir
 .vpane.files add .vpane.files.index
-if {!$use_ttk} {
-	.vpane.files paneconfigure .vpane.files.workdir -sticky news
-	.vpane.files paneconfigure .vpane.files.index -sticky news
+
+proc set_selection_colors {w has_focus} {
+	foreach tag [list in_diff in_sel] {
+		$w tag conf $tag \
+			-background [expr {$has_focus ? $color::select_bg : $color::inactive_select_bg}] \
+			-foreground [expr {$has_focus ? $color::select_fg : $color::inactive_select_fg}]
+	}
 }
 
 foreach i [list $ui_index $ui_workdir] {
 	rmsel_tag $i
-	$i tag conf in_diff -background [$i tag cget in_sel -background]
+
+	set_selection_colors $i 0
+	bind $i <FocusIn>	{ set_selection_colors %W 1 }
+	bind $i <FocusOut>	{ set_selection_colors %W 0 }
 }
 unset i
 
 # -- Diff and Commit Area
 #
-if {$have_tk85} {
-	${NS}::panedwindow .vpane.lower -orient vertical
-	${NS}::frame .vpane.lower.commarea
-	${NS}::frame .vpane.lower.diff -relief sunken -borderwidth 1 -height 500
-	.vpane.lower add .vpane.lower.diff
-	.vpane.lower add .vpane.lower.commarea
-	.vpane add .vpane.lower
-	if {$use_ttk} {
-		.vpane.lower pane .vpane.lower.diff -weight 1
-		.vpane.lower pane .vpane.lower.commarea -weight 0
-	} else {
-		.vpane.lower paneconfigure .vpane.lower.diff -stretch always
-		.vpane.lower paneconfigure .vpane.lower.commarea -stretch never
-	}
-} else {
-	frame .vpane.lower -height 300 -width 400
-	frame .vpane.lower.commarea
-	frame .vpane.lower.diff -relief sunken -borderwidth 1
-	pack .vpane.lower.diff -fill both -expand 1
-	pack .vpane.lower.commarea -side bottom -fill x
-	.vpane add .vpane.lower
-	.vpane paneconfigure .vpane.lower -sticky nsew
-}
+ttk::panedwindow .vpane.lower -orient vertical
+ttk::frame .vpane.lower.commarea
+ttk::frame .vpane.lower.diff -relief sunken -borderwidth 1 -height 500
+.vpane.lower add .vpane.lower.diff
+.vpane.lower add .vpane.lower.commarea
+.vpane add .vpane.lower
+.vpane.lower pane .vpane.lower.diff -weight 1
+.vpane.lower pane .vpane.lower.commarea -weight 0
 
 # -- Commit Area Buttons
 #
-${NS}::frame .vpane.lower.commarea.buttons
-${NS}::label .vpane.lower.commarea.buttons.l -text {} \
+ttk::frame .vpane.lower.commarea.buttons
+ttk::label .vpane.lower.commarea.buttons.l -text {} \
 	-anchor w \
 	-justify left
 pack .vpane.lower.commarea.buttons.l -side top -fill x
 pack .vpane.lower.commarea.buttons -side left -fill y
 
-${NS}::button .vpane.lower.commarea.buttons.rescan -text [mc Rescan] \
+ttk::button .vpane.lower.commarea.buttons.rescan -text [mc Rescan] \
 	-command ui_do_rescan
 pack .vpane.lower.commarea.buttons.rescan -side top -fill x
 lappend disable_on_lock \
 	{.vpane.lower.commarea.buttons.rescan conf -state}
 
-${NS}::button .vpane.lower.commarea.buttons.incall -text [mc "Stage Changed"] \
+ttk::button .vpane.lower.commarea.buttons.incall -text [mc "Stage Changed"] \
 	-command do_add_all
 pack .vpane.lower.commarea.buttons.incall -side top -fill x
 lappend disable_on_lock \
 	{.vpane.lower.commarea.buttons.incall conf -state}
 
 if {![is_enabled nocommitmsg]} {
-	${NS}::button .vpane.lower.commarea.buttons.signoff -text [mc "Sign Off"] \
+	ttk::button .vpane.lower.commarea.buttons.signoff -text [mc "Sign Off"] \
 		-command do_signoff
 	pack .vpane.lower.commarea.buttons.signoff -side top -fill x
 }
 
-${NS}::button .vpane.lower.commarea.buttons.commit -text [commit_btn_caption] \
+ttk::button .vpane.lower.commarea.buttons.commit -text [commit_btn_caption] \
 	-command do_commit
 pack .vpane.lower.commarea.buttons.commit -side top -fill x
 lappend disable_on_lock \
 	{.vpane.lower.commarea.buttons.commit conf -state}
 
 if {![is_enabled nocommit]} {
-	${NS}::button .vpane.lower.commarea.buttons.push -text [mc Push] \
+	ttk::button .vpane.lower.commarea.buttons.push -text [mc Push] \
 		-command do_push_anywhere
 	pack .vpane.lower.commarea.buttons.push -side top -fill x
 }
 
 # -- Commit Message Buffer
 #
-${NS}::frame .vpane.lower.commarea.buffer
-${NS}::frame .vpane.lower.commarea.buffer.header
+ttk::frame .vpane.lower.commarea.buffer
+ttk::frame .vpane.lower.commarea.buffer.header
 set ui_comm .vpane.lower.commarea.buffer.frame.t
 set ui_coml .vpane.lower.commarea.buffer.header.l
 
 if {![is_enabled nocommit]} {
-	${NS}::checkbutton .vpane.lower.commarea.buffer.header.amend \
+	ttk::checkbutton .vpane.lower.commarea.buffer.header.amend \
 		-text [mc "Amend Last Commit"] \
 		-variable commit_type_is_amend \
 		-command do_select_commit_type
@@ -3388,7 +3238,7 @@ if {![is_enabled nocommit]} {
 		[list .vpane.lower.commarea.buffer.header.amend conf -state]
 }
 
-${NS}::label $ui_coml \
+ttk::label $ui_coml \
 	-anchor w \
 	-justify left
 proc trace_commit_type {varname args} {
@@ -3411,7 +3261,7 @@ if {![is_enabled nocommit]} {
 }
 
 textframe .vpane.lower.commarea.buffer.frame
-ttext $ui_comm -background white -foreground black \
+ttext $ui_comm \
 	-borderwidth 1 \
 	-undo true \
 	-maxundo 20 \
@@ -3423,10 +3273,10 @@ ttext $ui_comm -background white -foreground black \
 	-font font_diff \
 	-xscrollcommand {.vpane.lower.commarea.buffer.frame.sbx set} \
 	-yscrollcommand {.vpane.lower.commarea.buffer.frame.sby set}
-${NS}::scrollbar .vpane.lower.commarea.buffer.frame.sbx \
+ttk::scrollbar .vpane.lower.commarea.buffer.frame.sbx \
 	-orient horizontal \
 	-command [list $ui_comm xview]
-${NS}::scrollbar .vpane.lower.commarea.buffer.frame.sby \
+ttk::scrollbar .vpane.lower.commarea.buffer.frame.sby \
 	-orient vertical \
 	-command [list $ui_comm yview]
 
@@ -3510,9 +3360,11 @@ tlabel .vpane.lower.diff.header.file \
 	-justify left
 tlabel .vpane.lower.diff.header.path \
 	-background gold \
-	-foreground black \
+	-foreground blue \
 	-anchor w \
-	-justify left
+	-justify left \
+	-font [eval font create [font configure font_ui] -underline 1] \
+	-cursor hand2
 pack .vpane.lower.diff.header.status -side left
 pack .vpane.lower.diff.header.file -side left
 pack .vpane.lower.diff.header.path -fill x
@@ -3527,14 +3379,18 @@ $ctxm add command \
 			-type STRING \
 			-- $current_diff_path
 	}
+$ctxm add command \
+	-label [mc Open] \
+	-command {do_file_open $current_diff_path}
 lappend diff_actions [list $ctxm entryconf [$ctxm index last] -state]
 bind_button3 .vpane.lower.diff.header.path "tk_popup $ctxm %X %Y"
+bind .vpane.lower.diff.header.path <Button-1> {do_file_open $current_diff_path}
 
 # -- Diff Body
 #
 textframe .vpane.lower.diff.body
 set ui_diff .vpane.lower.diff.body.t
-ttext $ui_diff -background white -foreground black \
+ttext $ui_diff \
 	-borderwidth 0 \
 	-width 80 -height 5 -wrap none \
 	-font font_diff \
@@ -3543,9 +3399,9 @@ ttext $ui_diff -background white -foreground black \
 	-yscrollcommand {.vpane.lower.diff.body.sby set} \
 	-state disabled
 catch {$ui_diff configure -tabstyle wordprocessor}
-${NS}::scrollbar .vpane.lower.diff.body.sbx -orient horizontal \
+ttk::scrollbar .vpane.lower.diff.body.sbx -orient horizontal \
 	-command [list $ui_diff xview]
-${NS}::scrollbar .vpane.lower.diff.body.sby -orient vertical \
+ttk::scrollbar .vpane.lower.diff.body.sby -orient vertical \
 	-command [list $ui_diff yview]
 pack .vpane.lower.diff.body.sbx -side bottom -fill x
 pack .vpane.lower.diff.body.sby -side right -fill y
@@ -3563,6 +3419,8 @@ $ui_diff tag configure clr1 -font font_diffbold
 $ui_diff tag configure clr4 -underline 1
 
 $ui_diff tag conf d_info -foreground blue -font font_diffbold
+$ui_diff tag conf d_rescan -foreground blue -underline 1 -font font_diffbold
+$ui_diff tag bind d_rescan <Button-1> { clear_diff; rescan ui_ready 0 }
 
 $ui_diff tag conf d_cr -elide true
 $ui_diff tag conf d_@ -font font_diffbold
@@ -3585,6 +3443,9 @@ $ui_diff tag conf d_s- \
 	-background ivory1
 
 $ui_diff tag conf d< \
+	-foreground orange \
+	-font font_diffbold
+$ui_diff tag conf d| \
 	-foreground orange \
 	-font font_diffbold
 $ui_diff tag conf d= \
@@ -3841,29 +3702,14 @@ proc on_ttk_pane_mapped {w pane pos} {
 	bind $w <Map> {}
 	after 0 [list after idle [list $w sashpos $pane $pos]]
 }
-proc on_tk_pane_mapped {w pane x y} {
-	bind $w <Map> {}
-	after 0 [list after idle [list $w sash place $pane $x $y]]
-}
 proc on_application_mapped {} {
-	global repo_config use_ttk
+	global repo_config
 	bind . <Map> {}
 	set gm $repo_config(gui.geometry)
-	if {$use_ttk} {
-		bind .vpane <Map> \
-		    [list on_ttk_pane_mapped %W 0 [lindex $gm 1]]
-		bind .vpane.files <Map> \
-		    [list on_ttk_pane_mapped %W 0 [lindex $gm 2]]
-	} else {
-		bind .vpane <Map> \
-		    [list on_tk_pane_mapped %W 0 \
-			 [lindex $gm 1] \
-			 [lindex [.vpane sash coord 0] 1]]
-		bind .vpane.files <Map> \
-		    [list on_tk_pane_mapped %W 0 \
-			 [lindex [.vpane.files sash coord 0] 0] \
-			 [lindex $gm 2]]
-	}
+	bind .vpane <Map> \
+		[list on_ttk_pane_mapped %W 0 [lindex $gm 1]]
+	bind .vpane.files <Map> \
+		[list on_ttk_pane_mapped %W 0 [lindex $gm 2]]
 	wm geometry . [lindex $gm 0]
 }
 if {[info exists repo_config(gui.geometry)]} {
@@ -3901,6 +3747,8 @@ bind $ui_comm <$M1B-Key-KP_Subtract> {show_less_context;break}
 bind $ui_comm <$M1B-Key-equal> {show_more_context;break}
 bind $ui_comm <$M1B-Key-plus> {show_more_context;break}
 bind $ui_comm <$M1B-Key-KP_Add> {show_more_context;break}
+bind $ui_comm <$M1B-Key-BackSpace> {event generate %W <Meta-Delete>;break}
+bind $ui_comm <$M1B-Key-Delete> {event generate %W <Meta-d>;break}
 
 bind $ui_diff <$M1B-Key-x> {tk_textCopy %W;break}
 bind $ui_diff <$M1B-Key-X> {tk_textCopy %W;break}
@@ -3982,60 +3830,6 @@ set file_lists($ui_workdir) [list]
 wm title . "[appname] ([reponame]) [file normalize $_gitworktree]"
 focus -force $ui_comm
 
-# -- Warn the user about environmental problems.  Cygwin's Tcl
-#    does *not* pass its env array onto any processes it spawns.
-#    This means that git processes get none of our environment.
-#
-if {[is_Cygwin]} {
-	set ignored_env 0
-	set suggest_user {}
-	set msg [mc "Possible environment issues exist.
-
-The following environment variables are probably
-going to be ignored by any Git subprocess run
-by %s:
-
-" [appname]]
-	foreach name [array names env] {
-		switch -regexp -- $name {
-		{^GIT_INDEX_FILE$} -
-		{^GIT_OBJECT_DIRECTORY$} -
-		{^GIT_ALTERNATE_OBJECT_DIRECTORIES$} -
-		{^GIT_DIFF_OPTS$} -
-		{^GIT_EXTERNAL_DIFF$} -
-		{^GIT_PAGER$} -
-		{^GIT_TRACE$} -
-		{^GIT_CONFIG$} -
-		{^GIT_(AUTHOR|COMMITTER)_DATE$} {
-			append msg " - $name\n"
-			incr ignored_env
-		}
-		{^GIT_(AUTHOR|COMMITTER)_(NAME|EMAIL)$} {
-			append msg " - $name\n"
-			incr ignored_env
-			set suggest_user $name
-		}
-		}
-	}
-	if {$ignored_env > 0} {
-		append msg [mc "
-This is due to a known issue with the
-Tcl binary distributed by Cygwin."]
-
-		if {$suggest_user ne {}} {
-			append msg [mc "
-
-A good replacement for %s
-is placing values for the user.name and
-user.email settings into your personal
-~/.gitconfig file.
-" $suggest_user]
-		}
-		warn_popup $msg
-	}
-	unset ignored_env msg suggest_user name
-}
-
 # -- Only initialize complex UI if we are going to stay running.
 #
 if {[is_enabled transport]} {
@@ -4088,7 +3882,7 @@ if {[winfo exists $ui_comm]} {
 				}
 			} elseif {$m} {
 				catch {
-					set fd [open [gitdir GITGUI_BCK] w]
+					set fd [safe_open_file [gitdir GITGUI_BCK] w]
 					fconfigure $fd -encoding utf-8
 					puts -nonewline $fd $msg
 					close $fd
@@ -4153,6 +3947,9 @@ if {[is_enabled retcode]} {
 if {$picked && [is_config_true gui.autoexplore]} {
 	do_explore
 }
+
+# Clear "Initializing..." status
+after 500 {$main_status show ""}
 
 # Local variables:
 # mode: tcl

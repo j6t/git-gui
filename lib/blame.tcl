@@ -24,6 +24,7 @@ field w_cviewer  ; # pane showing commit message
 field finder     ; # find mini-dialog frame
 field gotoline   ; # line goto mini-dialog frame
 field status     ; # status mega-widget instance
+field status_operation ; # operation displayed by status mega-widget
 field old_height ; # last known height of $w.file_pane
 
 
@@ -62,7 +63,7 @@ field tooltip_timer     {} ; # Current timer event for our tooltip
 field tooltip_commit    {} ; # Commit(s) in tooltip
 
 constructor new {i_commit i_path i_jump} {
-	global cursor_ptr M1B M1T have_tk85 use_ttk NS
+	global cursor_ptr M1B M1T
 	variable active_color
 	variable group_colors
 
@@ -202,18 +203,17 @@ constructor new {i_commit i_path i_jump} {
 		-width 80 \
 		-xscrollcommand [list $w.file_pane.out.sbx set] \
 		-font font_diff
-	if {$have_tk85} {
 		$w_file configure -inactiveselectbackground darkblue
-	}
+
 	$w_file tag conf found \
 		-background yellow
 
 	set w_columns [list $w_amov $w_asim $w_line $w_file]
 
-	${NS}::scrollbar $w.file_pane.out.sbx \
+	ttk::scrollbar $w.file_pane.out.sbx \
 		-orient h \
 		-command [list $w_file xview]
-	${NS}::scrollbar $w.file_pane.out.sby \
+	ttk::scrollbar $w.file_pane.out.sby \
 		-orient v \
 		-command [list scrollbar2many $w_columns yview]
 	eval grid $w_columns $w.file_pane.out.sby -sticky nsew
@@ -263,10 +263,10 @@ constructor new {i_commit i_path i_jump} {
 		-background $active_color \
 		-font font_ui
 	$w_cviewer tag raise sel
-	${NS}::scrollbar $w.file_pane.cm.sbx \
+	ttk::scrollbar $w.file_pane.cm.sbx \
 		-orient h \
 		-command [list $w_cviewer xview]
-	${NS}::scrollbar $w.file_pane.cm.sby \
+	ttk::scrollbar $w.file_pane.cm.sby \
 		-orient v \
 		-command [list $w_cviewer yview]
 	pack $w.file_pane.cm.sby -side right -fill y
@@ -274,6 +274,7 @@ constructor new {i_commit i_path i_jump} {
 	pack $w_cviewer -expand 1 -fill both
 
 	set status [::status_bar::new $w.status]
+	set status_operation {}
 
 	menu $w.ctxm -tearoff 0
 	$w.ctxm add command \
@@ -326,6 +327,7 @@ constructor new {i_commit i_path i_jump} {
 		bind $i <Any-Motion>  [cb _show_tooltip $i @%x,%y]
 		bind $i <Any-Enter>   [cb _hide_tooltip]
 		bind $i <Any-Leave>   [cb _hide_tooltip]
+		bind $i <Deactivate>  [cb _hide_tooltip]
 		bind_button3 $i "
 			[cb _hide_tooltip]
 			set cursorX %x
@@ -423,6 +425,7 @@ method _kill {} {
 
 method _load {jump} {
 	variable group_colors
+	global hashlength
 
 	_hide_tooltip $this
 
@@ -433,7 +436,7 @@ method _load {jump} {
 			$i conf -state normal
 			$i delete 0.0 end
 			foreach g [$i tag names] {
-				if {[regexp {^g[0-9a-f]{40}$} $g]} {
+				if {[regexp [string map "@@ $hashlength" {^g[0-9a-f]{@@}$}] $g]} {
 					$i tag delete $g
 				}
 			}
@@ -467,7 +470,7 @@ method _load {jump} {
 	$w_path conf -text [escape_path $path]
 
 	set do_textconv 0
-	if {![is_config_false gui.textconv] && [git-version >= 1.7.2]} {
+	if {![is_config_false gui.textconv]} {
 		set filter [gitattr $path diff set]
 		set textconv [get_config [join [list diff $filter textconv] .]]
 		if {$filter ne {set} && $textconv ne {}} {
@@ -478,14 +481,14 @@ method _load {jump} {
 		if {$do_textconv ne 0} {
 			set fd [open_cmd_pipe $textconv $path]
 		} else {
-			set fd [open $path r]
+			set fd [safe_open_file $path r]
 		}
 		fconfigure $fd -eofchar {}
 	} else {
 		if {$do_textconv ne 0} {
-			set fd [git_read cat-file --textconv "$commit:$path"]
+			set fd [git_read [list cat-file --textconv "$commit:$path"]]
 		} else {
-			set fd [git_read cat-file blob "$commit:$path"]
+			set fd [git_read [list cat-file blob "$commit:$path"]]
 		}
 	}
 	fconfigure $fd \
@@ -497,6 +500,8 @@ method _load {jump} {
 }
 
 method _history_menu {} {
+	global hashlength
+
 	set m $w.backmenu
 	if {[winfo exists $m]} {
 		$m delete 0 end
@@ -510,7 +515,7 @@ method _history_menu {} {
 		set c [lindex $e 0]
 		set f [lindex $e 1]
 
-		if {[regexp {^[0-9a-f]{40}$} $c]} {
+		if {[regexp [string map "@@ $hashlength" {^[0-9a-f]{@@}$}] $c]} {
 			set t [string range $c 0 8]...
 		} elseif {$c eq {}} {
 			set t {Working Directory}
@@ -602,21 +607,29 @@ method _exec_blame {cur_w cur_d options cur_s} {
 	} else {
 		lappend options $commit
 	}
+
+	# We may recurse in from another call to _exec_blame and already have
+	# a status operation.
+	if {$status_operation == {}} {
+		set status_operation [$status start \
+			$cur_s \
+			[mc "lines annotated"]]
+	} else {
+		$status_operation restart $cur_s
+	}
+
 	lappend options -- $path
-	set fd [eval git_read --nice blame $options]
+	set fd [git_read_nice [concat blame $options]]
 	fconfigure $fd -blocking 0 -translation lf -encoding utf-8
 	fileevent $fd readable [cb _read_blame $fd $cur_w $cur_d]
 	set current_fd $fd
 	set blame_lines 0
-
-	$status start \
-		$cur_s \
-		[mc "lines annotated"]
 }
 
 method _read_blame {fd cur_w cur_d} {
 	upvar #0 $cur_d line_data
 	variable group_colors
+	global hashlength nullid
 
 	if {$fd ne $current_fd} {
 		catch {close $fd}
@@ -625,7 +638,7 @@ method _read_blame {fd cur_w cur_d} {
 
 	$cur_w conf -state normal
 	while {[gets $fd line] >= 0} {
-		if {[regexp {^([a-z0-9]{40}) (\d+) (\d+) (\d+)$} $line line \
+		if {[regexp [string map "@@ $hashlength" {^([a-z0-9]{@@}) (\d+) (\d+) (\d+)$}] $line line \
 			cmit original_line final_line line_count]} {
 			set r_commit     $cmit
 			set r_orig_line  $original_line
@@ -638,7 +651,7 @@ method _read_blame {fd cur_w cur_d} {
 			set oln  $r_orig_line
 			set cmit $r_commit
 
-			if {[regexp {^0{40}$} $cmit]} {
+			if {$cmit eq $nullid} {
 				set commit_abbr work
 				set commit_type curr_commit
 			} elseif {$cmit eq $commit} {
@@ -797,19 +810,18 @@ method _read_blame {fd cur_w cur_d} {
 				# thorough copy search; insert before the threshold
 				set original_options [linsert $original_options 0 -C]
 			}
-			if {[git-version >= 1.5.3]} {
-				lappend original_options -w ; # ignore indentation changes
-			}
+			lappend original_options -w ; # ignore indentation changes
 
 			_exec_blame $this $w_amov @amov_data \
 				$original_options \
 				[mc "Loading original location annotations..."]
 		} else {
 			set current_fd {}
-			$status stop [mc "Annotation complete."]
+			$status_operation stop [mc "Annotation complete."]
+			set status_operation {}
 		}
 	} else {
-		$status update $blame_lines $total_lines
+		$status_operation update $blame_lines $total_lines
 	}
 } ifdeleted { catch {close $fd} }
 
@@ -846,9 +858,7 @@ method _fullcopyblame {} {
 	set threshold [get_config gui.copyblamethreshold]
 	set original_options [list -C -C "-C$threshold"]
 
-	if {[git-version >= 1.5.3]} {
-		lappend original_options -w ; # ignore indentation changes
-	}
+	lappend original_options -w ; # ignore indentation changes
 
 	# Find the line range
 	set pos @$::cursorX,$::cursorY
@@ -975,7 +985,7 @@ method _showcommit {cur_w lno} {
 		if {[catch {set msg $header($cmit,message)}]} {
 			set msg {}
 			catch {
-				set fd [git_read cat-file commit $cmit]
+				set fd [git_read [list cat-file commit $cmit]]
 				fconfigure $fd -encoding binary -translation lf
 				# By default commits are assumed to be in utf-8
 				set enc utf-8
@@ -1123,8 +1133,8 @@ method _blameparent {} {
 		} else {
 			set diffcmd [list diff-tree --unified=0 $cparent $cmit -- $new_path]
 		}
-		if {[catch {set fd [eval git_read $diffcmd]} err]} {
-			$status stop [mc "Unable to display parent"]
+		if {[catch {set fd [git_read $diffcmd]} err]} {
+			$status_operation stop [mc "Unable to display parent"]
 			error_popup [strcat [mc "Error loading diff:"] "\n\n$err"]
 			return
 		}
@@ -1287,7 +1297,7 @@ method _open_tooltip {cur_w} {
 	# On MacOS raising a window causes it to acquire focus.
 	# Tk 8.5 on MacOS seems to properly support wm transient,
 	# so we can safely counter the effect there.
-	if {$::have_tk85 && [is_MacOSX]} {
+	if {[is_MacOSX]} {
 		update
 		if {$w eq {}} {
 			raise .

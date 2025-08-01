@@ -59,7 +59,7 @@ proc merge_add_resolution {path} {
 	update_index \
 		[mc "Adding resolution for %s" [short_path $path]] \
 		[list $path] \
-		[concat $after [list ui_ready]]
+		[concat $after {ui_ready;}]
 }
 
 proc merge_force_stage {stage} {
@@ -88,7 +88,7 @@ proc merge_load_stages {path cont} {
 	set merge_stages(3) {}
 	set merge_stages_buf {}
 
-	set merge_stages_fd [eval git_read ls-files -u -z -- {$path}]
+	set merge_stages_fd [git_read [list ls-files -u -z -- $path]]
 
 	fconfigure $merge_stages_fd -blocking 0 -translation binary -encoding binary
 	fileevent $merge_stages_fd readable [list read_merge_stages $merge_stages_fd $cont]
@@ -272,8 +272,25 @@ proc merge_resolve_tool2 {} {
 		}
 	}
 	default {
-		error_popup [mc "Unsupported merge tool '%s'" $tool]
-		return
+		set tool_cmd [get_config mergetool.$tool.cmd]
+		if {$tool_cmd ne {}} {
+			if {([string first {[} $tool_cmd] != -1) || ([string first {]} $tool_cmd] != -1)} {
+				error_popup [mc "Unable to process square brackets in \"mergetool.%s.cmd\" configuration option.
+
+Please remove the square brackets." $tool]
+				return
+			} else {
+				set cmdline {}
+				foreach command_part $tool_cmd {
+					lappend cmdline [subst -nobackslashes -nocommands $command_part]
+				}
+			}
+		} else {
+			error_popup [mc "Unsupported merge tool '%s'.
+
+To use this tool, configure \"mergetool.%s.cmd\" as shown in the git-config manual page." $tool $tool]
+			return
+		}
 	}
 	}
 
@@ -293,7 +310,7 @@ proc merge_tool_get_stages {target stages} {
 	foreach fname $stages {
 		if {$merge_stages($i) eq {}} {
 			file delete $fname
-			catch { close [open $fname w] }
+			catch { close [safe_open_file $fname w] }
 		} else {
 			# A hack to support autocrlf properly
 			git checkout-index -f --stage=$i -- $target
@@ -343,9 +360,9 @@ proc merge_tool_start {cmdline target backup stages} {
 
 	# Force redirection to avoid interpreting output on stderr
 	# as an error, and launch the tool
-	lappend cmdline {2>@1}
+	set redir [list {2>@1}]
 
-	if {[catch { set mtool_fd [_open_stdout_stderr $cmdline] } err]} {
+	if {[catch { set mtool_fd [safe_open_command $cmdline $redir] } err]} {
 		delete_temp_files $mtool_tmpfiles
 		error_popup [mc "Could not start the merge tool:\n\n%s" $err]
 		return
