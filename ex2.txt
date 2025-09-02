@@ -1,1 +1,2 @@
-Exercise 2.2 test on a new branch
+Exercise 2.2 notes
+Created on: Tue Sep  2 14:40:05 IST 2025
