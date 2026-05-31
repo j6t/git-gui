@@ -372,7 +372,6 @@ if {[tk windowingsystem] eq "aqua"} {
 set _appname {Git Gui}
 set _gitdir {}
 set _gitworktree {}
-set _isbare {}
 set _githtmldir {}
 set _prefix {}
 set _reponame {}
@@ -524,29 +523,7 @@ proc get_config {name} {
 }
 
 proc is_bare {} {
-	global _isbare
-	global _gitdir
-	global _gitworktree
-
-	if {$_isbare eq {}} {
-		if {[catch {
-			set _bare [git rev-parse --is-bare-repository]
-			switch  -- $_bare {
-			true { set _isbare 1 }
-			false { set _isbare 0}
-			default { throw }
-			}
-		}]} {
-			if {[is_config_true core.bare]
-				|| ($_gitworktree eq {}
-					&& [lindex [file split $_gitdir] end] ne {.git})} {
-				set _isbare 1
-			} else {
-				set _isbare 0
-			}
-		}
-	}
-	return $_isbare
+	return [expr {$::_gitworktree eq {}}]
 }
 
 ######################################################################
