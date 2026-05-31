@@ -2999,101 +2999,105 @@ proc normalize_relpath {path} {
 	}
 }
 
+proc show_parse_err {err} {
+	if {[tk windowingsystem] eq "win32"} {
+		catch {wm withdraw .}
+		error_popup $err
+	} else {
+		puts stderr $err
+	}
+	exit 1
+}
+
 # -- Not a normal commit type invocation?  Do that instead!
 #
 switch -- $subcommand {
 browser -
 blame {
 	if {$subcommand eq "blame"} {
-		set subcommand_args {[--line=<num>] rev? path}
+		set subcommand_args {[--line=<num>] [rev] [--] <filename>}
+		set required_pathtype blob
 	} else {
-		set subcommand_args {rev? path}
+		set subcommand_args {[rev] [--] <dirname>}
+		set required_pathtype tree
 	}
-	if {$argv eq {}} usage
+	set maxargs [llength $subcommand_args]
+	set nargs [llength $argv]
+	if {$nargs < 1 || $nargs > $maxargs} usage
 	set head {}
 	set path {}
 	set jump_spec {}
-	set is_path 0
-	foreach a $argv {
-		set p [file join $_prefix $a]
 
-		if {$is_path || [file exists $p]} {
-			if {$path ne {}} usage
-			set path [normalize_relpath $p]
-			break
+	set iarg 0
+	foreach a $argv {
+		incr iarg
+		if {$iarg == $nargs} {
+			# final argument is path
+			set path [normalize_relpath [file join $_prefix $a]]
 		} elseif {$a eq {--}} {
-			if {$path ne {}} {
-				if {$head ne {}} usage
-				set head $path
-				set path {}
+			# allow before required final arg that must be path
+			if {$iarg != $nargs - 1} {
+				usage
 			}
-			set is_path 1
 		} elseif {[regexp {^--line=(\d+)$} $a a lnum]} {
-			if {$jump_spec ne {} || $head ne {}} usage
+			# --line can only be the first arg
+			if {$iarg != 1 || $subcommand ne {blame}} usage
 			set jump_spec [list $lnum]
 		} elseif {$head eq {}} {
-			if {$head ne {}} usage
 			set head $a
-			set is_path 1
 		} else {
 			usage
 		}
 	}
-	unset is_path
 
-	if {$head ne {} && $path eq {}} {
-		if {[string index $head 0] eq {/}} {
-			set path [normalize_relpath $head]
-			set head {}
+	# If head not given, use current branch (HEAD),
+	# and blame will use worktree if there is one.
+	set use_worktree 0
+	if {$head eq {}} {
+		load_current_branch
+		set head $current_branch
+		if {$subcommand eq {blame} && ![is_bare]} {
+			if {![file isfile $path]} {
+				show_parse_err [mc "fatal: no such file '%s' in worktree" $path]
+			}
+			set use_worktree 1
+		}
+	} else {
+		if {[catch {
+				set commitid \
+					[git rev-parse --verify --end-of-options \
+					[strcat $head "^{commit}"]]
+			}]} {
+			show_parse_err [mc "fatal: '%s' is not a valid rev'" $head]
 		} else {
-			set path [normalize_relpath $_prefix$head]
-			set head {}
+			set current_branch $head
 		}
 	}
 
-	if {$head eq {}} {
-		load_current_branch
-	} else {
-		if {[regexp [string map "@@ [expr $hashlength - 1]" {^[0-9a-f]{1,@@}$}] $head]} {
-			if {[catch {
-					set head [git rev-parse --verify $head]
-				} err]} {
-				if {[tk windowingsystem] eq "win32"} {
-					tk_messageBox -icon error -title [mc Error] -message $err
-				} else {
-					puts stderr $err
-				}
-				exit 1
-			}
+	# check path is known in head, and is file / directory as required
+	set pathtype {}
+	catch {set pathtype [git ls-tree {--format=%(objecttype)} $head $path]}
+	if {$pathtype ne {} && $path eq {.}} {
+		# ls-tree gives contents of root-dir, we need root-dir itself
+		set pathtype {tree}
+	}
+
+	if {$pathtype ne $required_pathtype} {
+		switch -- $required_pathtype {
+			tree {show_parse_err \
+				[mc "'%s' is not a directory in rev '%s'" $path $head]}
+			blob {show_parse_err \
+				[mc "'%s' is not a filename in rev '%s'" $path $head]}
 		}
-		set current_branch $head
 	}
 
 	wm deiconify .
 	switch -- $subcommand {
 	browser {
-		if {$jump_spec ne {}} usage
-		if {$head eq {}} {
-			if {$path ne {} && [file isdirectory $path]} {
-				set head $current_branch
-			} else {
-				set head $path
-				set path {}
-			}
-		}
 		browser::new $head $path
 	}
 	blame   {
-		if {$head eq {} && ![file exists $path]} {
-			catch {wm withdraw .}
-			tk_messageBox \
-				-icon error \
-				-type ok \
-				-title [mc "git-gui: fatal error"] \
-				-message [mc "fatal: cannot stat path %s: No such file or directory" $path]
-			exit 1
-		}
-		blame::new $head $path $jump_spec
+		blame::new [expr {$use_worktree ? {} : $head}] $path $jump_spec
 	}
 	}
 	return
