@@ -2024,11 +2024,7 @@ proc do_gitk {revs {is_submodule false}} {
 
 		set pwd [pwd]
 
-		if {!$is_submodule} {
-			if {![is_bare]} {
-				cd $_gitworktree
-			}
-		} else {
+		if {$is_submodule} {
 			cd $current_diff_path
 			if {$revs eq {--}} {
 				set s $file_states($current_diff_path)
