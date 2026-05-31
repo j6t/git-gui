@@ -1103,6 +1103,37 @@ unset argv0dir
 ##
 ## repository setup
 
+proc find_worktree_from_gitdir {} {
+	# this is invoked only if the current directory is inside the repository
+	set worktree {}
+	if {[file tail $::_gitdir] eq {.git}} {
+		# the dir containing .git is a worktree if repo allows it
+		# Check that git reports parent as a worktree (gitdir might not allow a worktree)
+		if {[catch {
+				set parent [file dirname $::_gitdir]
+				set worktree [git -C $parent rev-parse --show-toplevel]
+			}]} {
+			set worktree {}
+		}
+	} elseif [file exists {gitdir}] {
+		# a worktree gitdir has .gitdir naming worktree/.git
+		# assure git run there reports this dir as the gitdir (links might be broken)
+		if {[catch {
+				set fd_gitdir [open {gitdir} {r}]
+				set worktree [file dirname [read $fd_gitdir]]
+				catch {close $fd_gitdir}
+				set worktree_gitdir [git -C $worktree rev-parse --absolute-git-dir]
+				if {$::_gitdir ne $worktree_gitdir} {
+					set worktree {}
+				}
+			}]} {
+			catch {close $fd_gitdir}
+			set worktree {}
+		}
+	}
+	return $worktree
+}
+
 proc is_gitvars_error {err} {
 	set havevars 0
 	set GIT_DIR {}
@@ -1174,6 +1205,13 @@ if {[catch {
 	}
 	set _gitworktree {}
 	set _prefix {}
+}
+
+if {[is_bare]} {
+	# Maybe we are in an embedded or worktree specific gitdir
+	if {[set _gitworktree [find_worktree_from_gitdir]] ne {}} {
+		set _prefix {}
+	}
 }
 
 if {![is_bare]} {
