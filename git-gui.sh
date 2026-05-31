@@ -1153,9 +1153,14 @@ if {[catch {
 	load_config 1
 	apply_config
 	choose_repository::pick
-	if {![file isdirectory $_gitdir]} {
+	if {[catch {
+			set _gitdir [git rev-parse --git-dir]
+		} err]} {
+		catch {wm withdraw .}
+		error_popup [strcat [mc "Unusable repo/worktree:"] " [pwd] \n\n$err"]
 		exit 1
 	}
+	set _prefix {}
 	set picked 1
 }
 
