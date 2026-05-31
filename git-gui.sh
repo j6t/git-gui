@@ -1024,6 +1024,8 @@ proc load_config {include_global} {
 ##
 ## feature option selection
 
+enable_option picker
+enable_option gitdir_discovery
 if {[regexp {^git-(.+)$} [file tail $argv0] _junk subcommand]} {
 	unset _junk
 } else {
@@ -1035,6 +1037,9 @@ if {$subcommand eq {gui.sh}} {
 if {$subcommand eq {gui} && [llength $argv] > 0} {
 	set subcommand [lindex $argv 0]
 	set argv [lrange $argv 1 end]
+	if {$subcommand eq {gui}} {
+		disable_option picker
+	}
 }
 
 enable_option multicommit
@@ -1050,6 +1055,7 @@ blame {
 	disable_option multicommit
 	disable_option branch
 	disable_option transport
+	disable_option picker
 }
 citool {
 	enable_option singlecommit
@@ -1058,6 +1064,7 @@ citool {
 	disable_option multicommit
 	disable_option branch
 	disable_option transport
+	disable_option picker
 
 	while {[llength $argv] > 0} {
 		set a [lindex $argv 0]
@@ -1079,6 +1086,9 @@ citool {
 
 		set argv [lrange $argv 1 end]
 	}
+}
+pick {
+	disable_option gitdir_discovery
 }
 }
 
@@ -1168,7 +1178,7 @@ proc unset_gitdir_vars {} {
 
 # find repository
 set _gitdir {}
-if {$_gitdir eq {}} {
+if {[is_enabled gitdir_discovery]} {
 	if {[catch {
 			set _gitdir [git rev-parse --absolute-git-dir]
 		} err]} {
@@ -1180,7 +1190,7 @@ if {$_gitdir eq {}} {
 }
 
 set picked 0
-if {$_gitdir eq {}} {
+if {$_gitdir eq {} && [is_enabled picker]} {
 	unset_gitdir_vars
 	load_config 1
 	apply_config
@@ -1193,6 +1203,12 @@ if {$_gitdir eq {}} {
 		exit 1
 	}
 	set picked 1
+}
+
+if {$_gitdir eq {}} {
+	catch {wm withdraw .}
+	error_popup [strcat [mc "Git directory not found:"] "\n\n$err"]
+	exit 1
 }
 
 # find worktree, continue without if not required
@@ -3103,14 +3119,15 @@ blame {
 	return
 }
 citool -
-gui {
+gui -
+pick {
 	if {[llength $argv] != 0} {
 		usage
 	}
 	# fall through to setup UI for commits
 }
 default {
-	set err "[mc usage:] $argv0 \[{blame|browser|citool}\]"
+	set err "[mc usage:] $argv0 \[{blame|browser|citool|gui|pick}\]"
 	if {[tk windowingsystem] eq "win32"} {
 		wm withdraw .
 		tk_messageBox -icon error -message $err \
