@@ -374,6 +374,7 @@ set _gitdir {}
 set _gitworktree {}
 set _isbare {}
 set _githtmldir {}
+set _prefix {}
 set _reponame {}
 set _shellpath {@@SHELL_PATH@@}
 
@@ -1125,6 +1126,24 @@ unset argv0dir
 ##
 ## repository setup
 
+proc is_gitvars_error {err} {
+	set havevars 0
+	set GIT_DIR {}
+	set GIT_WORK_TREE {}
+	catch {set GIT_DIR $::env(GIT_DIR); set havevars 1}
+	catch {set GIT_WORK_TREE $::env(GIT_WORK_TREE); set havevars 1}
+
+	if {$havevars} {
+		catch {wm withdraw .}
+		error_popup [strcat [mc "Invalid configuration:"] \
+		   "\n" "GIT_DIR: " $GIT_DIR \
+		   "\n" "GIT_WORK_TREE: " $GIT_WORK_TREE \
+			"\n\n$err"]
+		return 1
+	}
+	return 0
+}
+
 proc set_gitdir_vars {} {
 	global _gitdir _gitworktree env
 	set env(GIT_DIR) $_gitdir
@@ -1139,16 +1158,22 @@ proc unset_gitdir_vars {} {
 	catch {unset env(GIT_WORK_TREE)}
 }
 
+# find repository
+set _gitdir {}
+if {$_gitdir eq {}} {
+	if {[catch {
+			set _gitdir [git rev-parse --absolute-git-dir]
+		} err]} {
+		if {[is_gitvars_error $err]} {
+			exit 1
+		}
+		set _gitdir {}
+	}
+}
+
 set picked 0
-if {[catch {
-		set _gitdir $env(GIT_DIR)
-		set _prefix {}
-		}]
-	&& [catch {
-		# beware that from the .git dir this sets _prefix to the empty string
-		set _gitdir [git rev-parse --absolute-git-dir]
-		set _prefix [git rev-parse --show-prefix]
-	} err]} {
+if {$_gitdir eq {}} {
+	unset_gitdir_vars
 	load_config 1
 	apply_config
 	choose_repository::pick
@@ -1159,7 +1184,6 @@ if {[catch {
 		error_popup [strcat [mc "Unusable repo/worktree:"] " [pwd] \n\n$err"]
 		exit 1
 	}
-	set _prefix {}
 	set picked 1
 }
 
@@ -1174,11 +1198,6 @@ if {$hashalgorithm eq "sha1"} {
 	exit 1
 }
 
-if {![file isdirectory $_gitdir]} {
-	catch {wm withdraw .}
-	error_popup [strcat [mc "Git directory not found:"] "\n\n$_gitdir"]
-	exit 1
-}
 # _gitdir exists, so try loading the config
 load_config 0
 apply_config
