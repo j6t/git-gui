@@ -670,6 +670,9 @@ proc load_current_branch {} {
 
 	set current_branch [git branch --show-current]
 	set is_detached [expr [string length $current_branch] == 0]
+	if {$is_detached} {
+		set current_branch {HEAD}
+	}
 }
 
 auto_load tk_optionMenu
