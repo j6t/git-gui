@@ -1187,6 +1187,33 @@ if {$_gitdir eq {}} {
 	set picked 1
 }
 
+# find worktree, continue without if not required
+if {[catch {
+		set _gitworktree [git rev-parse --show-toplevel]
+		set _prefix [git rev-parse --show-prefix]
+	} err]} {
+	if {[is_gitvars_error $err]} {
+		exit 1
+	}
+	set _gitworktree {}
+	set _prefix {}
+}
+
+if {![is_bare]} {
+	if {[catch {cd $_gitworktree} err]} {
+		catch {wm withdraw .}
+		error_popup [strcat [mc "No working directory"] " $_gitworktree:\n\n$err"]
+		exit 1
+	}
+} elseif {![is_enabled bare]} {
+	catch {wm withdraw .}
+	error_popup [strcat [mc "Cannot use bare repository:"] "\n\n$_gitdir"]
+	exit 1
+}
+
+# repository and worktree config are complete, export them
+set_gitdir_vars
+
 # Use object format as hash algorithm (either "sha1" or "sha256")
 set hashalgorithm [git rev-parse --show-object-format]
 if {$hashalgorithm eq "sha1"} {
@@ -1202,46 +1229,12 @@ if {$hashalgorithm eq "sha1"} {
 load_config 0
 apply_config
 
-set _gitworktree [git rev-parse --show-toplevel]
-
-if {$_prefix ne {}} {
-	if {$_gitworktree eq {}} {
-		regsub -all {[^/]+/} $_prefix ../ cdup
-	} else {
-		set cdup $_gitworktree
-	}
-	if {[catch {cd $cdup} err]} {
-		catch {wm withdraw .}
-		error_popup [strcat [mc "Cannot move to top of working directory:"] "\n\n$err"]
-		exit 1
-	}
-	set _gitworktree [pwd]
-	unset cdup
-} elseif {![is_enabled bare]} {
-	if {[is_bare]} {
-		catch {wm withdraw .}
-		error_popup [strcat [mc "Cannot use bare repository:"] "\n\n$_gitdir"]
-		exit 1
-	}
-	if {$_gitworktree eq {}} {
-		set _gitworktree [file dirname $_gitdir]
-	}
-	if {[catch {cd $_gitworktree} err]} {
-		catch {wm withdraw .}
-		error_popup [strcat [mc "No working directory"] " $_gitworktree:\n\n$err"]
-		exit 1
-	}
-	set _gitworktree [pwd]
-}
 set _reponame [file split [file normalize $_gitdir]]
 if {[lindex $_reponame end] eq {.git}} {
 	set _reponame [lindex $_reponame end-1]
 } else {
 	set _reponame [lindex $_reponame end]
 }
-
-# Export the final paths
-set_gitdir_vars
 
 ######################################################################
 ##
