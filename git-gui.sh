@@ -3336,10 +3336,10 @@ ttk::scrollbar .vpane.lower.commarea.buffer.frame.sby \
 
 pack .vpane.lower.commarea.buffer.frame.sbx -side bottom -fill x
 pack .vpane.lower.commarea.buffer.frame.sby -side right -fill y
-pack $ui_comm -side left -fill y
+pack $ui_comm -side left -fill both -expand 1
 pack .vpane.lower.commarea.buffer.header -side top -fill x
-pack .vpane.lower.commarea.buffer.frame -side left -fill y
-pack .vpane.lower.commarea.buffer -side left -fill y
+pack .vpane.lower.commarea.buffer.frame -side left -fill both -expand 1
+pack .vpane.lower.commarea.buffer -side left -fill both -expand 1
 
 # -- Commit Message Buffer Context Menu
 #
